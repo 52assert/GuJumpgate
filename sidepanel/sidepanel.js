@@ -8948,8 +8948,14 @@ function setSettingsCardLocked(locked) {
   }
   settingsCard.classList.toggle('is-locked', locked);
   settingsCard.toggleAttribute('inert', false);
+  const interactiveDuringAutoRunIds = new Set([
+    'row-custom-email-pool',
+    // PayPal 接码池在执行过程中仍要允许冷却恢复、手动获取验证码、增减号码等操作，
+    // 不能整体 inert，否则展开按钮和池内按钮都点不动。
+    'row-hosted-checkout-sms-pool',
+  ]);
   Array.from(settingsCard.children).forEach((child) => {
-    const keepInteractive = child?.id === 'row-custom-email-pool';
+    const keepInteractive = interactiveDuringAutoRunIds.has(child?.id || '');
     child.toggleAttribute('inert', Boolean(locked && !keepInteractive));
   });
 }
@@ -12915,6 +12921,7 @@ const hostedSmsPoolManager = window.SidepanelHostedSmsPoolManager?.createHostedS
     escapeHtml,
     openConfirmModal,
     showToast,
+    sendRuntimeMessage: sendRuntimeMessageWithTimeout,
   },
   state: {
     getText: () => normalizeHostedCheckoutSmsPoolTextValue(inputHostedCheckoutSmsPool?.value || latestState?.hostedCheckoutSmsPoolText || ''),

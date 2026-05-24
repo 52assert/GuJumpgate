@@ -217,6 +217,42 @@ function hasHostedOpenAiVerificationPopup() {
   return Boolean(document.getElementById('ci-ciBasic-0'));
 }
 
+// 当 Stripe 的税务/地址校验器无法识别我们填的地址时，会在结算页底部冒一条
+// "The customer's location isn't recognized. Set a valid customer address ..."
+// 形式的 Notice。Background 看到这个字段就知道要换一个地址重填重交。
+function getHostedOpenAiAddressErrorMessage() {
+  const ADDRESS_ERROR_PATTERN = /(?:customer'?s?\s+location\s+isn'?t\s+recognized|set\s+a\s+valid\s+(?:customer\s+)?address|地址.*?(?:无法识别|无效)|不正确的地址)/i;
+  // Stripe 的错误条结构：.ConfirmPaymentButton-Error > .Notice > .Notice-message
+  const noticeNodes = Array.from(document.querySelectorAll(
+    '.ConfirmPaymentButton-Error, .Notice--red, .Notice--error, [class*="Notice-message"]'
+  ));
+  for (const node of noticeNodes) {
+    if (!isVisibleElement(node)) {
+      continue;
+    }
+    const text = normalizeText(node.textContent || '');
+    if (ADDRESS_ERROR_PATTERN.test(text)) {
+      return text;
+    }
+  }
+  // 兜底：扫整个 main 区域的可见 alert/role=alert，因为 Stripe 偶尔会变 class 名。
+  const alerts = Array.from(document.querySelectorAll('[role="alert"], [aria-live="polite"], [aria-live="assertive"]'));
+  for (const node of alerts) {
+    if (!isVisibleElement(node)) {
+      continue;
+    }
+    const text = normalizeText(node.textContent || '');
+    if (ADDRESS_ERROR_PATTERN.test(text)) {
+      return text;
+    }
+  }
+  return '';
+}
+
+function hasHostedOpenAiAddressError() {
+  return Boolean(getHostedOpenAiAddressErrorMessage());
+}
+
 function fillHostedOpenAiInputById(id, value) {
   const input = document.getElementById(String(id || '').trim());
   if (!input) {
@@ -2105,6 +2141,8 @@ async function inspectPlusCheckoutState(options = {}) {
     readyState: document.readyState,
     hostedOpenAiPage: isHostedOpenAiCheckoutPage(),
     hostedVerificationVisible: hasHostedOpenAiVerificationPopup(),
+    hostedAddressError: hasHostedOpenAiAddressError(),
+    hostedAddressErrorMessage: getHostedOpenAiAddressErrorMessage(),
     hostedPayPalButtonFound: Boolean(findHostedOpenAiPayPalButton()),
     countryText: readCountryText(),
     hasPayPal: Boolean(findPayPalPaymentMethodTarget()),

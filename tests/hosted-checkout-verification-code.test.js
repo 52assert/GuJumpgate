@@ -97,3 +97,47 @@ test('manual hosted checkout code fetch ignores PayPal confirmation text with ex
     /暂未返回有效验证码/
   );
 });
+
+test('manual hosted checkout code fetch rejects "暂无验证码" placeholder response with expiration date', async () => {
+  const executor = createExecutorWithPayload(
+    'no|暂无验证码|到期时间：2026-07-29 00:00:00'
+  );
+
+  await assert.rejects(
+    () => executor.fetchHostedCheckoutVerificationCodeManually({
+      verificationUrl: 'http://example.test/api/get_sms?key=test',
+    }),
+    /暂未返回有效验证码/
+  );
+});
+
+test('manual hosted checkout code fetch rejects English "no sms" placeholder response', async () => {
+  const executor = createExecutorWithPayload(
+    'no|no sms received|expires_at: 2026-07-29 00:00:00'
+  );
+
+  await assert.rejects(
+    () => executor.fetchHostedCheckoutVerificationCodeManually({
+      verificationUrl: 'http://example.test/api/get_sms?key=test',
+    }),
+    /暂未返回有效验证码/
+  );
+});
+
+test('manual hosted checkout code fetch ignores 6-digit year-month pulled from YYYY-MM-DD dates without keyword', async () => {
+  // 即便 payload 没出现 "暂无" 关键字，纯日期字符串里抽出的 "2026-07" 也不应该被误判为验证码。
+  const executor = createExecutorWithPayload({
+    data: {
+      sms: '',
+      expired_date: '2026-07-29 00:00:00',
+      code_time: '2026-05-21 10:37:02',
+    },
+  });
+
+  await assert.rejects(
+    () => executor.fetchHostedCheckoutVerificationCodeManually({
+      verificationUrl: 'http://example.test/api/get_sms?key=test',
+    }),
+    /暂未返回有效验证码/
+  );
+});

@@ -1911,12 +1911,26 @@
           if (typeof fetchHostedCheckoutVerificationCodeManually !== 'function') {
             throw new Error('Hosted checkout 手动获取验证码能力尚未接入。');
           }
-          const result = await fetchHostedCheckoutVerificationCodeManually(message.payload || {});
-          return {
-            ok: true,
-            code: String(result?.code || '').trim(),
-            verificationUrl: String(result?.verificationUrl || '').trim(),
-          };
+          try {
+            const result = await fetchHostedCheckoutVerificationCodeManually(message.payload || {});
+            return {
+              ok: true,
+              code: String(result?.code || '').trim(),
+              verificationUrl: String(result?.verificationUrl || '').trim(),
+              codeTime: String(result?.codeTime || '').trim(),
+              codeTimeMs: Number(result?.codeTimeMs) || 0,
+              codeTimeText: String(result?.codeTimeText || '').trim(),
+              fetchedAtMs: Number(result?.fetchedAtMs) || Date.now(),
+              responseSnippet: String(result?.responseSnippet || ''),
+            };
+          } catch (error) {
+            const snippet = String(error?.responseSnippet || '');
+            return {
+              ok: false,
+              error: error?.message || String(error || '手动获取验证码失败'),
+              responseSnippet: snippet,
+            };
+          }
         }
 
         case 'TEST_PLUS_CHECKOUT_CONVERSION_PROXY': {

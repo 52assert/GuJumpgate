@@ -11,9 +11,14 @@ const PAYPAL_HOSTED_STAGE_VERIFICATION = 'verification';
 const PAYPAL_HOSTED_STAGE_REVIEW = 'review_consent';
 const PAYPAL_HOSTED_STAGE_APPROVAL = 'approval';
 const PAYPAL_HOSTED_STAGE_GENERIC_ERROR = 'generic_error';
+const PAYPAL_HOSTED_STAGE_EXCEED_PHONE = 'exceed_phone';
+const PAYPAL_HOSTED_STAGE_SLIDE_CAPTCHA = 'slide_captcha';
 const PAYPAL_HOSTED_STAGE_UNKNOWN = 'unknown';
 const PAYPAL_HOSTED_HERMES_AUTORUN_SENTINEL = '__MULTIPAGE_PAYPAL_HOSTED_HERMES_AUTORUN__';
 const PAYPAL_HOSTED_GUEST_SUBMIT_SENTINEL = '__MULTIPAGE_PAYPAL_HOSTED_GUEST_SUBMIT__';
+// 每次重新填写 guest checkout 表单都会让"提交代次"+1。
+// 旧的 clickHostedGenericSubmitButton 重试链发现代次变化即放弃，避免上一个手机号被反复重提。
+const PAYPAL_HOSTED_GUEST_SUBMIT_GENERATION = '__MULTIPAGE_PAYPAL_HOSTED_GUEST_SUBMIT_GEN__';
 
 if (document.documentElement.getAttribute(PAYPAL_FLOW_LISTENER_SENTINEL) !== '1') {
   document.documentElement.setAttribute(PAYPAL_FLOW_LISTENER_SENTINEL, '1');
@@ -306,6 +311,270 @@ function isPayPalHostedGenericErrorPage() {
     );
 }
 
+function findHostedExceedPhoneInterstitial() {
+  const exceedPattern = /try\s+a\s+different\s+phone\s+number/i;
+  const para = document.querySelector('[data-testid="exceed-para"]');
+  if (para && isVisibleElement(para) && exceedPattern.test(normalizeText(para.textContent || ''))) {
+    return para.closest('section[role="presentation"]')
+      || para.closest('[data-testid="sca-confirm-multi-field"]')
+      || para;
+  }
+  const containers = Array.from(document.querySelectorAll(
+    'section[role="presentation"], [data-testid="sca-confirm-multi-field"]'
+  ));
+  for (const container of containers) {
+    if (!isVisibleElement(container)) {
+      continue;
+    }
+    if (exceedPattern.test(normalizeText(container.textContent || ''))) {
+      return container;
+    }
+  }
+  return null;
+}
+
+function isPayPalHostedExceedPhoneError() {
+  return Boolean(findHostedExceedPhoneInterstitial());
+}
+
+function getPayPalHostedExceedPhoneMessage() {
+  const interstitial = findHostedExceedPhoneInterstitial();
+  if (!interstitial) {
+    return '';
+  }
+  const headline = interstitial.querySelector?.('[data-testid="exceed-main"]');
+  const para = interstitial.querySelector?.('[data-testid="exceed-para"]');
+  const parts = [];
+  if (headline) {
+    parts.push(normalizeText(headline.textContent || ''));
+  }
+  if (para) {
+    parts.push(normalizeText(para.textContent || ''));
+  }
+  return parts.filter(Boolean).join(' ');
+}
+
+function findHostedExceedPhonePrimaryButton() {
+  const direct = document.querySelector('[data-testid="primary-button-exceed"]');
+  if (direct && isVisibleElement(direct) && isEnabledControl(direct)) {
+    return direct;
+  }
+  const closeButton = document.querySelector('[data-testid="close-interstitial-button"]');
+  if (closeButton && isVisibleElement(closeButton) && isEnabledControl(closeButton)) {
+    return closeButton;
+  }
+  return null;
+}
+
+async function dismissHostedExceedPhoneInterstitial() {
+  await waitForDocumentComplete();
+  const interstitial = findHostedExceedPhoneInterstitial();
+  if (!interstitial) {
+    return {
+      stage: PAYPAL_HOSTED_STAGE_EXCEED_PHONE,
+      dismissed: false,
+      reason: 'interstitial_not_found',
+    };
+  }
+  const button = findHostedExceedPhonePrimaryButton();
+  if (!button) {
+    return {
+      stage: PAYPAL_HOSTED_STAGE_EXCEED_PHONE,
+      dismissed: false,
+      reason: 'primary_button_not_found',
+      message: getPayPalHostedExceedPhoneMessage(),
+    };
+  }
+  simulateClick(button);
+  await sleep(800);
+  // 弹窗确认后允许下一轮 fillHostedGuestCheckout 重新调度提交按钮；
+  // 同时把"提交代次"+1，让任何在 dismiss 之前已经在跑的 click 重试链识别为过期并退出，
+  // 否则它会在我们刚刚把页面切回 guest checkout 表单后用旧手机号再点一次提交。
+  const rootScope = typeof window !== 'undefined' ? window : globalThis;
+  rootScope[PAYPAL_HOSTED_GUEST_SUBMIT_SENTINEL] = false;
+  rootScope[PAYPAL_HOSTED_GUEST_SUBMIT_GENERATION] = (Number(rootScope[PAYPAL_HOSTED_GUEST_SUBMIT_GENERATION]) || 0) + 1;
+  return {
+    stage: PAYPAL_HOSTED_STAGE_EXCEED_PHONE,
+    dismissed: true,
+    stillVisible: Boolean(findHostedExceedPhoneInterstitial()),
+    message: getPayPalHostedExceedPhoneMessage(),
+  };
+}
+
+// ===== DataDome 滑块（拖到最右型）自动通过 =====
+
+function findPayPalDataDomeCaptchaContainer() {
+  const container = document.getElementById('ddv1-captcha-container')
+    || document.querySelector('[data-dd-ddv1-captcha-container]')
+    || document.querySelector('.custom_captcha');
+  if (container && isVisibleElement(container)) {
+    return container;
+  }
+  return null;
+}
+
+function findPayPalDataDomeSlideElements(container) {
+  const root = container || findPayPalDataDomeCaptchaContainer();
+  if (!root) return null;
+  const sliderContainer = root.querySelector('.sliderContainer');
+  const slider = root.querySelector('.slider');
+  const sliderBg = root.querySelector('.sliderbg');
+  if (!sliderContainer || !slider || !sliderBg) {
+    return null;
+  }
+  if (!isVisibleElement(slider) || !isVisibleElement(sliderBg)) {
+    return null;
+  }
+  return { sliderContainer, slider, sliderBg };
+}
+
+function isPayPalDataDomeSlideCaptcha() {
+  return Boolean(findPayPalDataDomeSlideElements());
+}
+
+function isPayPalDataDomeSlideCaptchaSolved(container) {
+  // DataDome 滑过后会把 captcha 框整体移除，或者把按钮切到"toggled"另一种状态。
+  // 这里以"再也找不到可拖动 slider"作为成功标志。
+  const root = container && container.isConnected ? container : findPayPalDataDomeCaptchaContainer();
+  if (!root) return true;
+  return !findPayPalDataDomeSlideElements(root);
+}
+
+function buildHumanLikeSlideTrajectory(startX, startY, endX, endY, options = {}) {
+  // 总时长 700–1400ms，30–48 步；ease-in-out 曲线 + Y 轴正弦抖动 + 每步耗时小幅扰动。
+  const totalDuration = Math.max(500, Number(options.durationMs) || (700 + Math.random() * 700));
+  const stepCount = Math.max(20, Math.floor(Number(options.stepCount) || (30 + Math.floor(Math.random() * 19))));
+  const dx = endX - startX;
+  const dy = endY - startY;
+  const easeInOut = (t) => (t < 0.5 ? 4 * t * t * t : 1 - ((-2 * t + 2) ** 3) / 2);
+  const trajectory = [];
+  for (let i = 1; i <= stepCount; i += 1) {
+    const linear = i / stepCount;
+    const eased = easeInOut(linear);
+    const baseX = startX + dx * eased;
+    const baseY = startY + dy * eased;
+    // 人手不会完全水平，叠加 ±3px 的正弦抖动 + ±1.5px 的随机抖动
+    const jitterY = Math.sin(linear * Math.PI * 3) * 3 + (Math.random() - 0.5) * 1.5;
+    // 每步耗时也带 ±5ms 抖动，避免完全等间距
+    const tElapsed = totalDuration * eased + (Math.random() - 0.5) * 8;
+    trajectory.push({ x: baseX, y: baseY + jitterY, t: tElapsed });
+  }
+  return trajectory;
+}
+
+function buildPointerEventInit(x, y, buttons) {
+  return {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    view: window,
+    clientX: x,
+    clientY: y,
+    screenX: x + (window.screenX || 0),
+    screenY: y + (window.screenY || 0),
+    button: 0,
+    buttons,
+    pointerId: 1,
+    pointerType: 'mouse',
+    isPrimary: true,
+    width: 1,
+    height: 1,
+    pressure: buttons ? 0.5 : 0,
+  };
+}
+
+function dispatchPointerSequence(target, type, init) {
+  // DataDome 同时监听 pointer / mouse / touch；保险起见三套都发。
+  try {
+    if (typeof PointerEvent === 'function') {
+      target.dispatchEvent(new PointerEvent(type, init));
+    }
+  } catch (error) {
+    void error;
+  }
+  const mouseType = type === 'pointerdown'
+    ? 'mousedown'
+    : (type === 'pointerup' ? 'mouseup' : 'mousemove');
+  try {
+    target.dispatchEvent(new MouseEvent(mouseType, init));
+  } catch (error) {
+    void error;
+  }
+}
+
+async function performPayPalDataDomeSlideDrag(slider, startX, startY, endX, endY) {
+  const trajectory = buildHumanLikeSlideTrajectory(startX, startY, endX, endY);
+  const downInit = buildPointerEventInit(startX, startY, 1);
+  dispatchPointerSequence(slider, 'pointerdown', downInit);
+
+  let lastT = 0;
+  for (const point of trajectory) {
+    const delay = Math.max(0, point.t - lastT);
+    if (delay > 0) {
+      await sleep(delay);
+    }
+    lastT = point.t;
+    const moveInit = buildPointerEventInit(point.x, point.y, 1);
+    // DataDome 在 document 层级监听全局指针移动；同步派发到 slider 自己。
+    dispatchPointerSequence(slider, 'pointermove', moveInit);
+    dispatchPointerSequence(document, 'pointermove', moveInit);
+  }
+
+  const last = trajectory[trajectory.length - 1];
+  const upInit = buildPointerEventInit(last.x, last.y, 0);
+  dispatchPointerSequence(slider, 'pointerup', upInit);
+  dispatchPointerSequence(document, 'pointerup', upInit);
+}
+
+async function attemptPayPalDataDomeSlideCaptcha(options = {}) {
+  const container = findPayPalDataDomeCaptchaContainer();
+  if (!container) {
+    return { solved: true, reason: 'no_captcha_present' };
+  }
+  const elements = findPayPalDataDomeSlideElements(container);
+  if (!elements) {
+    return { solved: false, reason: 'slider_not_found' };
+  }
+  const maxAttempts = Math.max(1, Math.min(5, Number(options.maxAttempts) || 3));
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (isPayPalDataDomeSlideCaptchaSolved(container)) {
+      return { solved: true, reason: 'already_solved', attempt };
+    }
+    const refreshed = findPayPalDataDomeSlideElements(container);
+    if (!refreshed) {
+      // captcha 已被服务端关掉
+      return { solved: true, reason: 'captcha_dismissed_before_drag', attempt };
+    }
+    const { slider, sliderBg } = refreshed;
+    const sliderRect = slider.getBoundingClientRect();
+    const bgRect = sliderBg.getBoundingClientRect();
+    if (!sliderRect.width || !bgRect.width) {
+      await sleep(400);
+      continue;
+    }
+    const startX = sliderRect.left + sliderRect.width / 2;
+    const startY = sliderRect.top + sliderRect.height / 2;
+    // 终点：拉到滑轨右端再多走 4px 保证视觉贴边
+    const endX = bgRect.right - sliderRect.width / 2 + 4;
+    const endY = startY + (Math.random() - 0.5) * 2;
+    log(`PayPal DataDome：第 ${attempt}/${maxAttempts} 次尝试拖动滑块（${Math.round(startX)},${Math.round(startY)}）→（${Math.round(endX)},${Math.round(endY)}）。`, 'info');
+    try {
+      await performPayPalDataDomeSlideDrag(slider, startX, startY, endX, endY);
+    } catch (error) {
+      log(`PayPal DataDome：拖动派发失败：${error?.message || error}`, 'warn');
+    }
+    // 等待服务端校验返回
+    await sleep(1800);
+    if (isPayPalDataDomeSlideCaptchaSolved(container)) {
+      return { solved: true, reason: 'drag_accepted', attempt };
+    }
+    log(`PayPal DataDome：第 ${attempt}/${maxAttempts} 次尝试后滑块仍在，准备重试。`, 'warn');
+    // 重试前等一下，避免连续两次拖动被 DataDome 直接拉黑
+    await sleep(900 + Math.random() * 600);
+  }
+  return { solved: false, reason: 'slider_still_present_after_retries' };
+}
+
 function isPayPalHostedReviewPage() {
   return /\/webapps\/hermes/i.test(getPayPalHostedPathname());
 }
@@ -355,6 +624,14 @@ function findHostedReviewConsentButton() {
 function detectPayPalHostedCheckoutStage() {
   if (!/paypal\./i.test(String(location?.host || ''))) {
     return PAYPAL_HOSTED_STAGE_OUTSIDE;
+  }
+  if (isPayPalDataDomeSlideCaptcha()) {
+    // DataDome 滑块通常覆盖在其他页面之上，必须最先识别。
+    return PAYPAL_HOSTED_STAGE_SLIDE_CAPTCHA;
+  }
+  if (isPayPalHostedExceedPhoneError()) {
+    // 优先识别 "Try a different phone number." 拦截弹窗，否则会被下方的 guest_checkout 分支吞掉。
+    return PAYPAL_HOSTED_STAGE_EXCEED_PHONE;
   }
   if (isPayPalHostedGenericErrorPage()) {
     return PAYPAL_HOSTED_STAGE_GENERIC_ERROR;
@@ -531,15 +808,33 @@ function dispatchHostedGenericClick(button) {
   button.dispatchEvent(new MouseEvent('click', eventInit));
 }
 
-async function clickHostedGenericSubmitButton(retries = 0) {
+async function clickHostedGenericSubmitButton(retries = 0, generation = null) {
+  const rootScope = typeof window !== 'undefined' ? window : globalThis;
+  // 仅在调用方传入 generation 时启用代次校验（guest checkout 调用会传，其他调用走旧行为）。
+  if (generation !== null && rootScope[PAYPAL_HOSTED_GUEST_SUBMIT_GENERATION] !== generation) {
+    return {
+      clicked: false,
+      aborted: true,
+      reason: 'guest_submit_generation_stale',
+    };
+  }
   removeHostedCaptchaArtifacts();
+  // 若 PayPal 已弹出 "Try a different phone number." 拦截弹窗，停止继续点提交按钮，
+  // 把控制权交还给 background 让它走号码切换分支。
+  if (typeof isPayPalHostedExceedPhoneError === 'function' && isPayPalHostedExceedPhoneError()) {
+    return {
+      clicked: false,
+      aborted: true,
+      reason: 'exceed_phone_interstitial_present',
+    };
+  }
   const button = findHostedGuestSubmitButton() || findEmailNextButton() || findLoginNextButton();
   if (!button) {
     if (retries >= 10) {
       throw new Error('PayPal hosted checkout 未找到可点击的继续/提交按钮。');
     }
     await sleep(1000);
-    return clickHostedGenericSubmitButton(retries + 1);
+    return clickHostedGenericSubmitButton(retries + 1, generation);
   }
 
   const buttonText = normalizeText(button.textContent || '');
@@ -548,7 +843,7 @@ async function clickHostedGenericSubmitButton(retries = 0) {
       throw new Error('PayPal hosted checkout 按钮长时间处于 disabled 状态。');
     }
     await sleep(1000);
-    return clickHostedGenericSubmitButton(retries + 1);
+    return clickHostedGenericSubmitButton(retries + 1, generation);
   }
 
   const rect = button.getBoundingClientRect();
@@ -557,7 +852,7 @@ async function clickHostedGenericSubmitButton(retries = 0) {
       throw new Error('PayPal hosted checkout 按钮长时间不可见。');
     }
     await sleep(1000);
-    return clickHostedGenericSubmitButton(retries + 1);
+    return clickHostedGenericSubmitButton(retries + 1, generation);
   }
 
   dispatchHostedGenericClick(button);
@@ -568,6 +863,16 @@ async function clickHostedGenericSubmitButton(retries = 0) {
     return {
       clicked: true,
       verificationRequired: true,
+      buttonText,
+    };
+  }
+
+  // 点完按钮后弹出拦截弹窗也直接放弃后续重试，等 background 切换号码后重新发起填表。
+  if (typeof isPayPalHostedExceedPhoneError === 'function' && isPayPalHostedExceedPhoneError()) {
+    return {
+      clicked: true,
+      aborted: true,
+      reason: 'exceed_phone_interstitial_appeared',
       buttonText,
     };
   }
@@ -583,7 +888,7 @@ async function clickHostedGenericSubmitButton(retries = 0) {
       };
     }
     await sleep(2000);
-    return clickHostedGenericSubmitButton(retries + 1);
+    return clickHostedGenericSubmitButton(retries + 1, generation);
   }
 
   return {
@@ -700,6 +1005,26 @@ async function fillHostedGuestCheckout(payload = {}) {
   await waitForDocumentComplete();
   startHostedCaptchaCleanupObserver();
   removeHostedCaptchaArtifacts();
+
+  const rootScope = typeof window !== 'undefined' ? window : globalThis;
+  // 任何在 dismiss 之前已被调度的旧 click 重试链，看到 generation 变化后会立刻退出；
+  // 这样可以避免上一个手机号被反复重新提交，覆盖掉这里马上要写入的新号码。
+  const generation = (Number(rootScope[PAYPAL_HOSTED_GUEST_SUBMIT_GENERATION]) || 0) + 1;
+  rootScope[PAYPAL_HOSTED_GUEST_SUBMIT_GENERATION] = generation;
+  // 重置 sentinel，让本次填写完之后能够重新调度一次提交。
+  rootScope[PAYPAL_HOSTED_GUEST_SUBMIT_SENTINEL] = false;
+
+  // 在开始写入输入框之前先确认拦截弹窗已经消失，避免输入框被覆盖、fillHostedInputById 因 invisible 而静默失败。
+  try {
+    await waitUntil(() => !isPayPalHostedExceedPhoneError(), {
+      intervalMs: 250,
+      timeoutMs: 8000,
+      timeoutMessage: 'PayPal hosted checkout 拦截弹窗未在预期时间内关闭，无法继续重新填写。',
+    });
+  } catch (error) {
+    log(`PayPal guest checkout：等待拦截弹窗关闭失败：${error?.message || error}`, 'warn');
+  }
+
   log(`PayPal guest checkout：收到 payload.phone=${String(payload?.phone || '').trim() || '(空)'}，payload.address=${JSON.stringify(payload?.address || {})}`, 'info');
 
   await sleep(2000);
@@ -739,11 +1064,10 @@ async function fillHostedGuestCheckout(payload = {}) {
   fillHostedInputById('billingLine1', address.street || '');
   selectHostedOptionByIdText('billingState', address.state || '');
 
-  const rootScope = typeof window !== 'undefined' ? window : globalThis;
   if (!rootScope[PAYPAL_HOSTED_GUEST_SUBMIT_SENTINEL]) {
     rootScope[PAYPAL_HOSTED_GUEST_SUBMIT_SENTINEL] = true;
     setTimeout(() => {
-      clickHostedGenericSubmitButton(0).catch((error) => {
+      clickHostedGenericSubmitButton(0, generation).catch((error) => {
         log(`PayPal hosted checkout guest submit 失败：${error?.message || error}`, 'warn');
       }).finally(() => {
         rootScope[PAYPAL_HOSTED_GUEST_SUBMIT_SENTINEL] = false;
@@ -756,6 +1080,7 @@ async function fillHostedGuestCheckout(payload = {}) {
     submitted: true,
     verificationRequired: Boolean(hasHostedVerificationInputs()),
     submitScheduled: true,
+    generation,
   };
 }
 
@@ -806,6 +1131,12 @@ async function runHostedCheckoutStep(payload = {}) {
     return clickHostedReviewConsent();
   }
   const stage = detectPayPalHostedCheckoutStage();
+  if (stage === PAYPAL_HOSTED_STAGE_SLIDE_CAPTCHA) {
+    return attemptPayPalDataDomeSlideCaptcha({ maxAttempts: Number(payload?.slideCaptchaMaxAttempts) || 3 });
+  }
+  if (stage === PAYPAL_HOSTED_STAGE_EXCEED_PHONE) {
+    return dismissHostedExceedPhoneInterstitial();
+  }
   if (stage === PAYPAL_HOSTED_STAGE_VERIFICATION) {
     if (payload.resendVerificationCode) {
       return clickHostedVerificationResend();
@@ -1082,6 +1413,11 @@ function inspectPayPalState() {
     hasHostedGuestCheckout: hostedStage === PAYPAL_HOSTED_STAGE_GUEST_CHECKOUT,
     hostedGenericError: hostedStage === PAYPAL_HOSTED_STAGE_GENERIC_ERROR,
     hostedGenericErrorMessage: getPayPalHostedGenericErrorMessage(),
+    hostedExceedPhoneError: hostedStage === PAYPAL_HOSTED_STAGE_EXCEED_PHONE,
+    hostedExceedPhoneMessage: getPayPalHostedExceedPhoneMessage(),
+    hostedExceedPhoneAcknowledgeReady: Boolean(findHostedExceedPhonePrimaryButton()),
+    hostedSlideCaptchaVisible: hostedStage === PAYPAL_HOSTED_STAGE_SLIDE_CAPTCHA
+      || Boolean(findPayPalDataDomeCaptchaContainer()),
     verificationInputsVisible: hasHostedVerificationInputs(),
     hostedVerificationInvalidCode: hasHostedInvalidVerificationCodeError(),
     hostedVerificationErrorText: getHostedVerificationErrorText(),

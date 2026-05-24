@@ -144,6 +144,19 @@
         "content/paypal-flow.js"
       ],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://*.paypal.com/*",
+        "https://*.captcha-delivery.com/*",
+        "https://*.ddc.paypal.com/*"
+      ],
+      "all_frames": true,
+      "match_about_blank": true,
+      "js": [
+        "content/paypal-datadome-captcha.js"
+      ],
+      "run_at": "document_idle"
     }
   ],
   "action": {

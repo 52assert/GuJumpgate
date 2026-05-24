@@ -27,6 +27,8 @@
       isGpcTaskEndedFailure,
       isHostedCheckoutGenericErrorFailure,
       isHostedCheckoutVerificationResendLimitFailure,
+      isHostedCheckoutSlideCaptchaFailedFailure,
+      isLocalCpaJsonExportFailedFailure,
       isPhoneSmsPlatformRateLimitFailure,
       isPlusCheckoutNonFreeTrialFailure,
       isRestartCurrentAttemptError,
@@ -700,6 +702,12 @@
             const blockedByHostedCheckoutVerificationResendLimit = typeof isHostedCheckoutVerificationResendLimitFailure === 'function'
               ? isHostedCheckoutVerificationResendLimitFailure(err)
               : /HOSTED_CHECKOUT_VERIFICATION_RESEND_LIMIT::/i.test(err?.message || String(err || ''));
+            const blockedByLocalCpaJsonExportFailed = typeof isLocalCpaJsonExportFailedFailure === 'function'
+              ? isLocalCpaJsonExportFailedFailure(err)
+              : /LOCAL_CPA_JSON_EXPORT_FAILED::/i.test(err?.message || String(err || ''));
+            const blockedByHostedCheckoutSlideCaptcha = typeof isHostedCheckoutSlideCaptchaFailedFailure === 'function'
+              ? isHostedCheckoutSlideCaptchaFailedFailure(err)
+              : /HOSTED_CHECKOUT_SLIDE_CAPTCHA_FAILED::/i.test(err?.message || String(err || ''));
             const blockedByCloudCheckoutAlreadyPaid = typeof isCloudCheckoutAlreadyPaidFailure === 'function'
               ? isCloudCheckoutAlreadyPaidFailure(err)
               : /\buser\s+is\s+already\s+paid\b|already\s+(?:paid|subscribed)/i.test(err?.message || String(err || ''));
@@ -721,6 +729,8 @@
               && !blockedByGpcTaskEnded
               && !blockedByHostedCheckoutGenericError
               && !blockedByHostedCheckoutVerificationResendLimit
+              && !blockedByLocalCpaJsonExportFailed
+              && !blockedByHostedCheckoutSlideCaptcha
               && !blockedByCloudCheckoutAlreadyPaid
               && !blockedBySignupUserAlreadyExists
               && autoRunSkipFailures
@@ -1040,6 +1050,56 @@
               await broadcastStopToContentScripts();
               await addLog(
                 `第 ${targetRun}/${totalRuns} 轮 PayPal 验证码自动 Resend 已达到上限，当前自动运行已停止；请尝试在页面手动获取验证码并填入。`,
+                'warn'
+              );
+              stoppedEarly = true;
+              await broadcastAutoRunStatus('stopped', {
+                currentRun: targetRun,
+                totalRuns,
+                attemptRun,
+                sessionId: 0,
+              });
+              break;
+            }
+
+            if (blockedByLocalCpaJsonExportFailed) {
+              roundSummary.status = 'failed';
+              roundSummary.finalFailureReason = reason;
+              await setState({
+                autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
+              });
+              await appendRoundRecordIfNeeded('failed', reason, err);
+              cancelPendingCommands('当前轮因本地 CPA JSON 导出连续失败已终止。');
+              await broadcastStopToContentScripts();
+              // 本地 CPA JSON 是当前流程的最终产物，导出失败意味着账号实际没有可用的产物，
+              // 因此无论是否勾选了"失败时跳过到下一邮箱"，都立即暂停自动运行交给用户处理，
+              // 避免在丢失账号产物的情况下静默换下一个邮箱继续。
+              await addLog(
+                `第 ${targetRun}/${totalRuns} 轮本地 CPA JSON 导出已连续重试失败，当前自动运行将暂停，请检查本地助手/插件目录后再恢复。`,
+                'error'
+              );
+              stoppedEarly = true;
+              await broadcastAutoRunStatus('stopped', {
+                currentRun: targetRun,
+                totalRuns,
+                attemptRun,
+                sessionId: 0,
+              });
+              break;
+            }
+
+            if (blockedByHostedCheckoutSlideCaptcha) {
+              roundSummary.status = 'failed';
+              roundSummary.finalFailureReason = reason;
+              await setState({
+                autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
+              });
+              await appendRoundRecordIfNeeded('failed', reason, err);
+              cancelPendingCommands('当前轮因 PayPal DataDome 滑块自动通过失败已终止。');
+              await broadcastStopToContentScripts();
+              // 滑块属于风控信号：再换号也大概率被同样拒，立即把控制权交还给用户手动滑过。
+              await addLog(
+                `第 ${targetRun}/${totalRuns} 轮 PayPal 触发 DataDome 滑块且自动拖动连续失败，当前自动运行将暂停，请在 PayPal 标签页手动完成滑块或检查代理后再恢复。`,
                 'warn'
               );
               stoppedEarly = true;

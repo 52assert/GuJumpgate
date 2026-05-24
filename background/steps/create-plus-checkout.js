@@ -35,6 +35,13 @@
   const HOSTED_CHECKOUT_GENERIC_ERROR_PREFIX = 'HOSTED_CHECKOUT_GENERIC_ERROR::';
   const HOSTED_CHECKOUT_VERIFICATION_RESEND_LIMIT_PREFIX = 'HOSTED_CHECKOUT_VERIFICATION_RESEND_LIMIT::';
   const HOSTED_CHECKOUT_VERIFICATION_RESEND_MAX_ATTEMPTS = 1;
+  const HOSTED_CHECKOUT_SLIDE_CAPTCHA_FAILED_PREFIX = 'HOSTED_CHECKOUT_SLIDE_CAPTCHA_FAILED::';
+  // 当 PayPal 提示 "Try a different phone number." 时给失败号码加冷却：
+  // 默认 5 分钟；同一号码累计被拒 3 次及以上后，进入 30 分钟"长冷却"，防止反复在不可用号码上原地循环。
+  // 期间该号码会从自动选号池中跳过，UI 也会标记为"冷却中"，到期后自动恢复可用。
+  const HOSTED_CHECKOUT_EXCEED_PHONE_COOLDOWN_MS = 5 * 60 * 1000;
+  const HOSTED_CHECKOUT_EXCEED_PHONE_LONG_COOLDOWN_MS = 30 * 60 * 1000;
+  const HOSTED_CHECKOUT_EXCEED_PHONE_LONG_COOLDOWN_THRESHOLD = 3;
   const CHECKOUT_CONVERSION_PROXY_SETTINGS_SCOPE = 'regular';
   const CHECKOUT_CONVERSION_PROXY_BYPASS_LIST = ['<local>', 'localhost', '127.0.0.1'];
   const CHECKOUT_CONVERSION_PROXY_TARGET_HOST_PATTERNS = [
@@ -855,6 +862,9 @@ function FindProxyForURL(url, host) {
           usedAt: Math.max(0, Number(usage.usedAt) || 0),
           lastAttemptAt: Math.max(0, Number(usage.lastAttemptAt) || 0),
           lastError: String(usage.lastError || '').trim(),
+          disabledUntil: Math.max(0, Number(usage.disabledUntil) || 0),
+          unavailableCount: Math.max(0, Math.floor(Number(usage.unavailableCount) || 0)),
+          lastUnavailableAt: Math.max(0, Number(usage.lastUnavailableAt) || 0),
         }];
       }).filter(([key]) => Boolean(key)));
     }
@@ -893,16 +903,25 @@ function FindProxyForURL(url, host) {
         return null;
       }
       const normalizedUsage = normalizeHostedCheckoutSmsPoolUsage(usage);
-      return entries
+      const now = Date.now();
+      const candidates = entries
         .map((entry, index) => {
           const itemUsage = normalizedUsage[entry.key] || {};
+          const disabledUntil = Math.max(0, Number(itemUsage.disabledUntil) || 0);
           return {
             ...entry,
             index: Number.isFinite(entry.index) ? entry.index : index,
             useCount: Math.max(0, Math.floor(Number(itemUsage.useCount) || 0)),
             usedAt: Math.max(0, Number(itemUsage.usedAt) || 0),
+            disabledUntil,
+            disabled: disabledUntil > now,
           };
         })
+        .filter((entry) => !entry.disabled);
+      if (candidates.length === 0) {
+        return null;
+      }
+      return candidates
         .sort((left, right) => {
           if (left.useCount !== right.useCount) {
             return left.useCount - right.useCount;
@@ -962,6 +981,24 @@ function FindProxyForURL(url, host) {
       const now = Date.now();
       const incrementUseCount = Boolean(options.incrementUseCount);
       const success = options.success === true;
+      const previousDisabledUntil = Math.max(0, Number(previous.disabledUntil) || 0);
+      // 显式传入 disabledUntil 时直接覆盖（包含传 0 表示清除冷却）；
+      // 未显式传入时保留上次的 disabledUntil 值。
+      const hasExplicitDisabledUntil = Object.prototype.hasOwnProperty.call(options, 'disabledUntil');
+      const nextDisabledUntil = hasExplicitDisabledUntil
+        ? Math.max(0, Number(options.disabledUntil) || 0)
+        : (success ? 0 : previousDisabledUntil);
+      const previousUnavailableCount = Math.max(0, Math.floor(Number(previous.unavailableCount) || 0));
+      const incrementUnavailable = Boolean(options.incrementUnavailable);
+      const resetUnavailable = Boolean(options.resetUnavailable);
+      const nextUnavailableCount = (() => {
+        if (resetUnavailable) return 0;
+        if (incrementUnavailable) return previousUnavailableCount + 1;
+        return previousUnavailableCount;
+      })();
+      const nextLastUnavailableAt = incrementUnavailable
+        ? now
+        : (resetUnavailable ? 0 : Math.max(0, Number(previous.lastUnavailableAt) || 0));
       const nextUsage = {
         ...usage,
         [normalizedEntry.key]: {
@@ -973,6 +1010,9 @@ function FindProxyForURL(url, host) {
             : Math.max(0, Number(previous.usedAt) || 0),
           lastAttemptAt: now,
           lastError: success ? '' : String(options.error || '').trim(),
+          disabledUntil: nextDisabledUntil,
+          unavailableCount: nextUnavailableCount,
+          lastUnavailableAt: nextLastUnavailableAt,
         },
       };
       await applyHostedCheckoutRuntimePatch({
@@ -1260,13 +1300,65 @@ function FindProxyForURL(url, host) {
       };
     }
 
+    function hostedCheckoutPayloadIndicatesNoSms(payload = {}) {
+      // 把整段响应铺平成一段字符串，用于识别"暂无验证码 / no sms / no message" 这类"没新短信"的语义提示。
+      let aggregated = '';
+      const seenLocal = new Set();
+      function walk(value) {
+        if (value === null || value === undefined) return;
+        if (typeof value === 'string' || typeof value === 'number') {
+          aggregated += `${value} `;
+          return;
+        }
+        if (typeof value !== 'object') return;
+        if (seenLocal.has(value)) return;
+        seenLocal.add(value);
+        if (Array.isArray(value)) {
+          value.forEach(walk);
+        } else {
+          Object.values(value).forEach(walk);
+        }
+      }
+      walk(payload);
+      const text = aggregated.trim();
+      if (!text) return false;
+      // 中文："暂无/没有/未收到/尚未/无" + "验证码/短信/消息"
+      if (/(?:暂无|没有|未收到|尚未|未到达|未刷新)\s*(?:验证码|短信|消息|新.{0,4}短信)/.test(text)) {
+        return true;
+      }
+      // 英文：no/none/empty/null/pending + sms/code/message/data
+      if (/\b(?:no|none|empty|null|pending|not\s+received)\s+(?:new\s+)?(?:sms|code|message|messages|verification|otp|data|record)/i.test(text)) {
+        return true;
+      }
+      // 接码服务常见的 "no|..." / "false|..." 起始标识。
+      if (/^\s*(?:no|false|fail|failed|error|err)\s*(?:\||,|:)/i.test(text)) {
+        return true;
+      }
+      return false;
+    }
+
     function extractHostedCheckoutVerificationCode(payload = {}) {
+      // 上游接口在"没新短信"时常返回 `no|暂无验证码|到期时间：YYYY-MM-DD` 之类，
+      // 这种情况下我们直接判定为暂无验证码，否则下面正则会把 YYYY-MM-DD 当成 6 位数字 (202607) 误识别。
+      if (hostedCheckoutPayloadIndicatesNoSms(payload)) {
+        return '';
+      }
       const trustedTextKeyPattern = /^(sms|message|msg|text|content|body|code|otp|verification_code|verificationCode)$/i;
       const metadataKeyPattern = /(^|[_-])(phone|mobile|tel|id|order|time|date|expired|expire|status)([_-]|$)/i;
-      const contextualCodePattern = /(?:security\s*code|verification\s*code|one[-\s]?time\s*(?:passcode|code)|passcode|otp|code|验证码|安全码)[\s\S]{0,50}?(\d[\s-]?\d[\s-]?\d[\s-]?\d[\s-]?\d[\s-]?\d)|(\d[\s-]?\d[\s-]?\d[\s-]?\d[\s-]?\d[\s-]?\d)[\s\S]{0,50}?(?:security\s*code|verification\s*code|one[-\s]?time\s*(?:passcode|code)|passcode|otp|code|验证码|安全码)/i;
-      const exactCodePattern = /^\D*(\d[\s-]?\d[\s-]?\d[\s-]?\d[\s-]?\d[\s-]?\d)\D*$/;
+      // 关键词收紧：standalone "code" 移除（很多 SMS 接口在没有新短信时会返回类似
+      // "Error code 100001" / "status code 200" 的公共错误页，旧规则会把状态码当成验证码）。
+      // 仅保留与"验证/安全/动态密码"明确相关的强上下文词。
+      const KEYWORD = '(?:security\\s*code|verification\\s*code|one[-\\s]?time\\s*(?:passcode|code)|passcode|otp|verification|verify|验证码|安全码|动态密码|登录码)';
+      // 6 位数字之间只允许"无分隔"或"空格"，不再允许 dash —— 不然 `2026-07-29` 这种日期会被当成 `202607`。
+      const DIGITS = '(\\d\\s?\\d\\s?\\d\\s?\\d\\s?\\d\\s?\\d)';
+      // 关键词与 6 位数字的间距从 50 缩短为 30，避免跨段误匹配。
+      const contextualCodePattern = new RegExp(
+        `${KEYWORD}[\\s\\S]{0,30}?${DIGITS}|${DIGITS}[\\s\\S]{0,30}?${KEYWORD}`,
+        'i'
+      );
+      // 单字段精确匹配（如 `code: "201412"`）也禁止 dash。
+      const exactCodePattern = /^\D*(\d\s?\d\s?\d\s?\d\s?\d\s?\d)\D*$/;
       const seen = new Set();
-
       function collectCandidates(value, path = '') {
         if (value === null || value === undefined) {
           return [];
@@ -1324,6 +1416,96 @@ function FindProxyForURL(url, host) {
       return '';
     }
 
+    function extractHostedCheckoutVerificationCodeTimestamp(payload = {}) {
+      // 在接码池/SMS 接口返回里找一个可用的"短信发出时间"。
+      // 优先字段：以 _time / _at / _date 结尾，或精确匹配 time/timestamp/date 等的字段，
+      // 但要排除 expire(d)/expiry（这些是订阅截止时间，不是短信时间）。
+      const acceptedKeyPattern = /(^|[_-])(code|sms|message|msg|text|content|body|recv|received|sent|send|created|update|updated|notify|notified)[_-](time|at|date|datetime|timestamp|ts)$|^(time|timestamp|ts|date|datetime|sent_at|sentAt|created_at|createdAt|received_at|receivedAt)$/i;
+      const excludedKeyPattern = /expire|expiry|expir|deadline|valid_until|validUntil/i;
+      const seen = new Set();
+
+      function collect(value, path = '', key = '') {
+        if (value === null || value === undefined) {
+          return [];
+        }
+        if (typeof value === 'string' || typeof value === 'number') {
+          return [{ key, path, value }];
+        }
+        if (typeof value !== 'object') {
+          return [];
+        }
+        if (seen.has(value)) {
+          return [];
+        }
+        seen.add(value);
+        if (Array.isArray(value)) {
+          return value.flatMap((item, index) => collect(item, `${path}[${index}]`, ''));
+        }
+        return Object.entries(value).flatMap(([childKey, childValue]) => (
+          collect(childValue, path ? `${path}.${childKey}` : childKey, childKey)
+        ));
+      }
+
+      function parseTimestamp(value) {
+        if (value === null || value === undefined || value === '') {
+          return null;
+        }
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          // 容忍秒级或毫秒级时间戳。
+          const ms = value > 1e12 ? value : value * 1000;
+          const date = new Date(ms);
+          return Number.isFinite(date.getTime()) ? date : null;
+        }
+        const text = String(value).trim();
+        if (!text) {
+          return null;
+        }
+        if (/^\d{10,13}$/.test(text)) {
+          const numeric = Number(text);
+          const ms = numeric > 1e12 ? numeric : numeric * 1000;
+          const date = new Date(ms);
+          return Number.isFinite(date.getTime()) ? date : null;
+        }
+        // "2026-05-22 12:25:10" -> 把空格转成 T 让 Date 正确按本地时区解析。
+        const normalized = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/.test(text)
+          ? text.replace(' ', 'T')
+          : text;
+        const date = new Date(normalized);
+        return Number.isFinite(date.getTime()) && date.getTime() > 0 ? date : null;
+      }
+
+      const candidates = collect(payload).filter((candidate) => {
+        const key = String(candidate.key || '');
+        const path = String(candidate.path || '');
+        if (!acceptedKeyPattern.test(key)) {
+          return false;
+        }
+        return !(excludedKeyPattern.test(key) || excludedKeyPattern.test(path));
+      });
+
+      let bestDate = null;
+      let bestText = '';
+      for (const candidate of candidates) {
+        const date = parseTimestamp(candidate.value);
+        if (!date) {
+          continue;
+        }
+        if (!bestDate || date.getTime() > bestDate.getTime()) {
+          bestDate = date;
+          bestText = String(candidate.value).trim();
+        }
+      }
+
+      if (!bestDate) {
+        return { codeTime: '', codeTimeMs: 0, codeTimeText: '' };
+      }
+      return {
+        codeTime: bestDate.toISOString(),
+        codeTimeMs: bestDate.getTime(),
+        codeTimeText: bestText,
+      };
+    }
+
     async function fetchHostedCheckoutVerificationCode() {
       const runtimeConfig = await getHostedCheckoutRuntimeConfig({
         ensureCurrentSmsEntry: true,
@@ -1364,8 +1546,10 @@ function FindProxyForURL(url, host) {
         throw new Error('hosted checkout 验证码接口暂未返回有效验证码。');
       }
       if (runtimeConfig.hostedCheckoutUsesSmsPool && runtimeConfig.hostedCheckoutCurrentSmsEntry) {
+        // 成功取到验证码说明这个号码本轮是可用的，清零 unavailableCount。
         await updateHostedCheckoutPoolUsage(runtimeConfig.hostedCheckoutCurrentSmsEntry, {
           success: true,
+          resetUnavailable: true,
         });
       }
       return code;
@@ -1395,12 +1579,30 @@ function FindProxyForURL(url, host) {
           payload = text;
         }
         const code = extractHostedCheckoutVerificationCode(payload);
+        const timestamp = extractHostedCheckoutVerificationCodeTimestamp(payload);
+        const responseSnippet = (() => {
+          const snippetSource = typeof payload === 'string'
+            ? text
+            : (() => {
+              try { return JSON.stringify(payload); } catch { return text; }
+            })();
+          return String(snippetSource || '').slice(0, 400);
+        })();
         if (!code) {
-          throw new Error('hosted checkout 验证码接口暂未返回有效验证码。');
+          const error = new Error(
+            `hosted checkout 验证码接口暂未返回有效验证码。接口响应片段：${responseSnippet || '(空)'}`
+          );
+          error.responseSnippet = responseSnippet;
+          throw error;
         }
         return {
           code,
           verificationUrl: manualVerificationUrl,
+          codeTime: String(timestamp?.codeTime || ''),
+          codeTimeMs: Number(timestamp?.codeTimeMs) || 0,
+          codeTimeText: String(timestamp?.codeTimeText || ''),
+          fetchedAtMs: Date.now(),
+          responseSnippet,
         };
       }
       try {
@@ -1409,6 +1611,11 @@ function FindProxyForURL(url, host) {
         return {
           code,
           verificationUrl: String(runtimeConfig?.verificationUrl || '').trim(),
+          codeTime: '',
+          codeTimeMs: 0,
+          codeTimeText: '',
+          fetchedAtMs: Date.now(),
+          responseSnippet: '',
         };
       } finally {
         await clearHostedCheckoutCurrentSmsEntry();
@@ -1499,6 +1706,143 @@ function FindProxyForURL(url, host) {
       );
     }
 
+    async function pickHostedCheckoutPoolEntryExcluding(failedKeys) {
+      const state = typeof getState === 'function' ? await getState().catch(() => ({})) : {};
+      let stored = {};
+      if (chrome?.storage?.local?.get) {
+        stored = await chrome.storage.local.get([
+          'hostedCheckoutSmsPoolText',
+          'hostedCheckoutSmsPoolUsage',
+        ]).catch(() => ({}));
+      }
+      const poolEntries = parseHostedCheckoutSmsPoolEntries(
+        stored?.hostedCheckoutSmsPoolText
+        || state?.hostedCheckoutSmsPoolText
+        || ''
+      );
+      const poolUsage = normalizeHostedCheckoutSmsPoolUsage(
+        stored?.hostedCheckoutSmsPoolUsage
+        || state?.hostedCheckoutSmsPoolUsage
+        || {}
+      );
+      const filtered = (failedKeys instanceof Set && failedKeys.size > 0)
+        ? poolEntries.filter((entry) => !failedKeys.has(entry.key))
+        : poolEntries;
+      const now = Date.now();
+      const activeCount = filtered.filter((entry) => {
+        const usage = poolUsage[entry.key] || {};
+        const disabledUntil = Math.max(0, Number(usage.disabledUntil) || 0);
+        return disabledUntil <= now;
+      }).length;
+      // chooseHostedCheckoutSmsPoolEntry 内部已会跳过冷却中的号码，
+      // 此处用 active/total 数量供错误信息提示。
+      const nextEntry = chooseHostedCheckoutSmsPoolEntry(filtered, poolUsage);
+      // 计算最近的冷却到期时间，用于"全部冷却中"时的等待提示。
+      let nearestDisabledUntil = 0;
+      for (const entry of filtered) {
+        const usage = poolUsage[entry.key] || {};
+        const disabledUntil = Math.max(0, Number(usage.disabledUntil) || 0);
+        if (disabledUntil > now && (nearestDisabledUntil === 0 || disabledUntil < nearestDisabledUntil)) {
+          nearestDisabledUntil = disabledUntil;
+        }
+      }
+      return {
+        nextEntry,
+        poolSize: poolEntries.length,
+        remainingCount: filtered.length,
+        activeCount,
+        nearestDisabledUntil,
+      };
+    }
+
+    async function handleHostedCheckoutExceedPhone(tabId, guestProfile, pageState = {}) {
+      const pageMessage = String(pageState?.hostedExceedPhoneMessage || '').trim()
+        || 'Try a different phone number.';
+
+      const failedConfig = await getHostedCheckoutRuntimeConfig({
+        ensureCurrentSmsEntry: false,
+      });
+      const failedEntry = failedConfig?.hostedCheckoutCurrentSmsEntry || null;
+      const failedPhone = String(failedEntry?.phone || failedConfig?.phone || '').trim();
+      // 查询当前号码累计的不可用次数。本次失败后将变为 previous+1，
+      // 若达到长冷却阈值（默认 3 次）就启用更长的冷却，避免反复重试已知不可用的号码。
+      const failedUsageSnapshot = failedEntry?.key
+        ? (await (async () => {
+          const stateNow = typeof getState === 'function' ? await getState().catch(() => ({})) : {};
+          const usageMap = normalizeHostedCheckoutSmsPoolUsage(stateNow?.hostedCheckoutSmsPoolUsage || {});
+          return usageMap[failedEntry.key] || null;
+        })())
+        : null;
+      const previousUnavailableCount = Math.max(0, Math.floor(Number(failedUsageSnapshot?.unavailableCount) || 0));
+      const nextUnavailableCount = previousUnavailableCount + 1;
+      const useLongCooldown = nextUnavailableCount >= HOSTED_CHECKOUT_EXCEED_PHONE_LONG_COOLDOWN_THRESHOLD;
+      const cooldownMs = useLongCooldown
+        ? HOSTED_CHECKOUT_EXCEED_PHONE_LONG_COOLDOWN_MS
+        : HOSTED_CHECKOUT_EXCEED_PHONE_COOLDOWN_MS;
+      const cooldownMinutes = Math.round(cooldownMs / 60000);
+
+      await addLog(
+        `步骤 6：PayPal hosted checkout 提示 "${pageMessage}"（当前号码：${failedPhone || '(空)'}，累计不可用 ${nextUnavailableCount} 次），将该号码冷却 ${cooldownMinutes} 分钟后再放回池中，并切换其它号码继续。`,
+        'warn'
+      );
+
+      if (failedEntry?.key) {
+        await updateHostedCheckoutPoolUsage(failedEntry, {
+          incrementUseCount: false,
+          success: false,
+          error: pageMessage,
+          disabledUntil: Date.now() + cooldownMs,
+          incrementUnavailable: true,
+        });
+      }
+      await clearHostedCheckoutCurrentSmsEntry();
+
+      // 关闭 PayPal 的拦截弹窗，让页面回到 guest checkout 表单。
+      try {
+        await runHostedCheckoutPayPalStep(tabId, {
+          ...guestProfile,
+          dismissExceedPhoneInterstitial: true,
+        });
+      } catch (error) {
+        await addLog(
+          `步骤 6：关闭 PayPal "Try a different phone number." 拦截弹窗失败：${error?.message || error}`,
+          'warn'
+        );
+      }
+
+      const { nextEntry, poolSize, activeCount, nearestDisabledUntil } = await pickHostedCheckoutPoolEntryExcluding();
+      if (!nextEntry) {
+        if (!failedEntry?.key) {
+          throw new Error(
+            '步骤 6：PayPal hosted checkout 提示 "Try a different phone number."，但当前未配置 PayPal 接码池，无法自动换号。请在号码池中导入更多号码后重试。'
+          );
+        }
+        const waitSeconds = nearestDisabledUntil > 0
+          ? Math.max(1, Math.ceil((nearestDisabledUntil - Date.now()) / 1000))
+          : 0;
+        const waitSuffix = waitSeconds > 0
+          ? `（最快约 ${waitSeconds} 秒后第一个号码恢复可用）`
+          : '';
+        throw new Error(
+          `步骤 6：PayPal hosted checkout 提示 "Try a different phone number."，但接码池中暂无可用号码（池总数 ${poolSize}，当前活跃 ${activeCount}）${waitSuffix}，请补充新号码或等待冷却结束后重试。`
+        );
+      }
+
+      const nextUsage = await updateHostedCheckoutPoolUsage(nextEntry, {
+        incrementUseCount: true,
+        success: true,
+      });
+      await addLog(
+        `步骤 6：PayPal 接码池已切换至号码 ${nextEntry.phone}（累计使用 ${Math.max(0, Number(nextUsage?.[nextEntry.key]?.useCount) || 0)} 次），准备重新填写并提交 guest checkout。`,
+        'info'
+      );
+
+      if (guestProfile && typeof guestProfile === 'object') {
+        // 同步更新 guestProfile.phone，避免后续 hostedStage===guest_checkout 回退到旧号码。
+        guestProfile.phone = nextEntry.phone;
+      }
+    }
+
     async function runHostedCheckoutOpenAiFlow(tabId, guestProfile) {
       await ensureContentScriptReadyOnTabUntilStopped(PLUS_CHECKOUT_SOURCE, tabId, {
         inject: PLUS_CHECKOUT_INJECT_FILES,
@@ -1516,6 +1860,12 @@ function FindProxyForURL(url, host) {
       if (initialResult?.error) {
         throw new Error(initialResult.error);
       }
+
+      // Stripe 偶尔识别不到我们填的地址（"The customer's location isn't recognized."），
+      // 这时换一个地址重填重交。最多重试 3 次（含初始那次不算），过则报错。
+      const HOSTED_OPENAI_ADDRESS_RETRY_MAX = 3;
+      let addressRetryCount = 0;
+      let addressErrorHandledAt = 0;
 
       const startedAt = Date.now();
       let verificationSubmitted = false;
@@ -1541,6 +1891,50 @@ function FindProxyForURL(url, host) {
         if (state?.error) {
           throw new Error(state.error);
         }
+
+        // 地址错误优先级最高：先解决了再继续，否则后续 verification 等都会卡住。
+        // 加 5 秒去抖防止刚换完地址、Stripe 还没刷新就又触发一次。
+        if (state?.hostedAddressError && (Date.now() - addressErrorHandledAt > 5000)) {
+          if (addressRetryCount >= HOSTED_OPENAI_ADDRESS_RETRY_MAX) {
+            throw new Error(
+              `步骤 6：Stripe 连续 ${HOSTED_OPENAI_ADDRESS_RETRY_MAX} 次拒绝填写的账单地址（${state?.hostedAddressErrorMessage || '地址校验失败'}），已达到自动换地址重试上限，请检查地址源接口或换代理后重试。`
+            );
+          }
+          addressRetryCount += 1;
+          addressErrorHandledAt = Date.now();
+          const prevAddress = guestProfile.address || {};
+          await addLog(
+            `步骤 6：检测到 Stripe 地址校验失败（${state?.hostedAddressErrorMessage || '位置不可识别'}），正在更换地址重新填写（${addressRetryCount}/${HOSTED_OPENAI_ADDRESS_RETRY_MAX}）...`,
+            'warn'
+          );
+          let nextAddress;
+          try {
+            nextAddress = await fetchHostedCheckoutAddress();
+          } catch (error) {
+            throw new Error(`步骤 6：换地址时调用地址接口失败：${error?.message || error}`);
+          }
+          await addLog(
+            `步骤 6：替换地址 ${JSON.stringify(prevAddress)} -> ${JSON.stringify(nextAddress)}`,
+            'info'
+          );
+          // 同步更新 guestProfile，后面 PayPal 阶段填账单地址时也用新地址。
+          guestProfile.address = nextAddress;
+          // 重新派发 RUN_HOSTED_OPENAI_CHECKOUT_STEP，让 content script 用新地址重填并再次提交。
+          const retryResult = await sendTabMessageUntilStopped(tabId, PLUS_CHECKOUT_SOURCE, {
+            type: 'RUN_HOSTED_OPENAI_CHECKOUT_STEP',
+            source: 'background',
+            payload: {
+              address: nextAddress,
+            },
+          });
+          if (retryResult?.error) {
+            throw new Error(retryResult.error);
+          }
+          // 给 Stripe 一点时间重新校验，再进下一轮 poll。
+          await sleepWithStop(2500);
+          continue;
+        }
+
         if (state?.hostedVerificationVisible && !verificationSubmitted) {
           await addLog('步骤 6：检测到 hosted checkout OpenAI 验证码弹窗，正在获取并填写验证码...', 'info');
           const verificationCode = await pollHostedCheckoutVerificationCode();
@@ -1617,6 +2011,10 @@ function FindProxyForURL(url, host) {
       let hostedVerificationResendAttempts = 0;
       let hostedVerificationSubmitted = false;
       let loggedWaitingForHostedVerificationResult = false;
+      // 同一次 PayPal 链路里允许尝试自动过 DataDome 滑块的次数；过多就直接转人工兜底，
+      // 防止脚本一直在被风控的会话里继续打 captcha 进一步污染该会话。
+      const HOSTED_CHECKOUT_SLIDE_CAPTCHA_MAX_ATTEMPTS = 3;
+      let hostedSlideCaptchaAttempts = 0;
       while (Date.now() - startedAt < HOSTED_CHECKOUT_PAYPAL_LOOP_TIMEOUT_MS) {
         throwIfStopped();
         const tab = await chrome?.tabs?.get?.(tabId).catch(() => null);
@@ -1650,9 +2048,52 @@ function FindProxyForURL(url, host) {
         }
 
         const pageState = await getHostedCheckoutPayPalState(tabId);
+        if (pageState.hostedStage === 'slide_captcha' || pageState.hostedSlideCaptchaVisible) {
+          hostedVerificationSubmitted = false;
+          loggedWaitingForHostedVerificationResult = false;
+          hostedSlideCaptchaAttempts += 1;
+          await addLog(
+            `步骤 6：检测到 PayPal DataDome 滑块验证码，准备第 ${hostedSlideCaptchaAttempts}/${HOSTED_CHECKOUT_SLIDE_CAPTCHA_MAX_ATTEMPTS} 次尝试自动拖动通过...`,
+            'info'
+          );
+          let slideResult = null;
+          try {
+            slideResult = await runHostedCheckoutPayPalStep(tabId, {
+              ...guestProfile,
+              slideCaptchaMaxAttempts: 1,
+            });
+          } catch (error) {
+            await addLog(
+              `步骤 6：PayPal DataDome 滑块拖动派发失败：${error?.message || error}`,
+              'warn'
+            );
+          }
+          if (slideResult?.solved) {
+            await addLog('步骤 6：PayPal DataDome 滑块已通过，继续后续支付链路。', 'ok');
+            // 服务端校验返回需要一点时间；这里再额外等一下避免立即检查时状态没刷新。
+            await sleepWithStop(1500);
+            continue;
+          }
+          if (hostedSlideCaptchaAttempts >= HOSTED_CHECKOUT_SLIDE_CAPTCHA_MAX_ATTEMPTS) {
+            throw new Error(
+              `${HOSTED_CHECKOUT_SLIDE_CAPTCHA_FAILED_PREFIX}PayPal 触发 DataDome 滑块验证码，自动连续 ${HOSTED_CHECKOUT_SLIDE_CAPTCHA_MAX_ATTEMPTS} 次拖动均未通过。请在 PayPal 标签页手动完成滑块后再继续，或检查是否已被风控临时拉黑。`
+            );
+          }
+          await sleepWithStop(1500 + Math.floor(Math.random() * 800));
+          continue;
+        }
+
         if (pageState.hostedStage === 'generic_error' || pageState.hostedGenericError) {
           await requestHostedCheckoutGenericErrorChoice(tabId, pageState);
           return;
+        }
+
+        if (pageState.hostedStage === 'exceed_phone' || pageState.hostedExceedPhoneError) {
+          hostedVerificationSubmitted = false;
+          loggedWaitingForHostedVerificationResult = false;
+          await handleHostedCheckoutExceedPhone(tabId, guestProfile, pageState);
+          await sleepWithStop(1500);
+          continue;
         }
 
         if (

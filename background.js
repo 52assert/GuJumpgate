@@ -3079,6 +3079,11 @@ function normalizePersistentSettingValue(key, value) {
           usedAt: Math.max(0, Number(item.usedAt) || 0),
           lastAttemptAt: Math.max(0, Number(item.lastAttemptAt) || 0),
           lastError: String(item.lastError || '').trim(),
+          // 这三个字段一定要进持久化白名单，否则每次 setState 会被悄悄抹掉，
+          // 重新加载扩展后用户看到的就是 disabledUntil/unavailableCount/lastUnavailableAt 都丢了。
+          disabledUntil: Math.max(0, Number(item.disabledUntil) || 0),
+          unavailableCount: Math.max(0, Math.floor(Number(item.unavailableCount) || 0)),
+          lastUnavailableAt: Math.max(0, Number(item.lastUnavailableAt) || 0),
         }];
       }).filter(([key]) => Boolean(key)));
     case 'paypalEmail':
@@ -5406,12 +5411,32 @@ async function ensureHotmailMailboxReadyForAutoRunRound(options = {}) {
 
     let account = null;
     if (remainingAuthorizedAccounts.length) {
-      account = await ensureHotmailAccountForFlow({
-        allowAllocate: true,
-        markUsed: false,
-        preferredAccountId,
-        excludeIds: [...exhaustedAccountIds],
-      });
+      try {
+        account = await ensureHotmailAccountForFlow({
+          allowAllocate: true,
+          markUsed: false,
+          preferredAccountId,
+          excludeIds: [...exhaustedAccountIds],
+        });
+      } catch (error) {
+        // 已授权的候选可能因 outlook 子别名容量已满 / 当前选号缺资格等原因被 ensureHotmailAccountForFlow
+        // 整体拒绝（throw "没有可用的 Hotmail 账号..."），而此处缺少兜底会让那 throw 直接逃出本函数，
+        // 让外层 auto-run 把整个 attempt 视为失败，pending 账号也丧失被 verify 的机会。
+        // 这里把本批 authorized 候选整体加入 exhausted，让 while 顶部下一轮过滤把它们剔除，
+        // 自然落到 pending 校验分支去尝试 verify 还未验证的待校验账号。
+        lastError = error;
+        remainingAuthorizedAccounts.forEach((candidate) => {
+          if (candidate?.id) {
+            exhaustedAccountIds.add(candidate.id);
+          }
+        });
+        preferredAccountId = null;
+        await addLog(
+          `自动运行${buildRoundLabel()}开始前已授权 Hotmail 账号均不可分配（${error?.message || error}），将改为校验待校验账号。`,
+          'warn'
+        );
+        continue;
+      }
     } else {
       const pendingAccount = pickPendingHotmailAccountForVerification(latestAccounts, {
         preferredAccountId,
@@ -9608,6 +9633,16 @@ function isHostedCheckoutVerificationResendLimitFailure(error) {
   return /HOSTED_CHECKOUT_VERIFICATION_RESEND_LIMIT::|PayPal 验证码自动 Resend 重试已达到上限|请尝试在页面手动获取验证码并填入/i.test(message);
 }
 
+function isLocalCpaJsonExportFailedFailure(error) {
+  const message = getErrorMessage(error);
+  return /LOCAL_CPA_JSON_EXPORT_FAILED::/i.test(message);
+}
+
+function isHostedCheckoutSlideCaptchaFailedFailure(error) {
+  const message = getErrorMessage(error);
+  return /HOSTED_CHECKOUT_SLIDE_CAPTCHA_FAILED::/i.test(message);
+}
+
 function isCloudCheckoutAlreadyPaidFailure(error) {
   const message = getErrorMessage(error);
   return /\buser\s+is\s+already\s+paid\b|already\s+(?:paid|subscribed)|already\s+has\s+(?:an?\s+)?(?:active\s+)?subscription|(?:用户|账号|账户)[\s\S]*(?:已|已经)[\s\S]*(?:付费|订阅|开通)|(?:已|已经)[\s\S]*(?:付费|订阅|开通)[\s\S]*(?:用户|账号|账户)|该账号已经开通过\s*ChatGPT\s*订阅套餐/i.test(message);
@@ -10710,6 +10745,164 @@ async function clickWithDebugger(tabId, rect, options = {}) {
   }
 }
 
+// 通过 chrome.debugger CDP 真实派发鼠标事件来过 DataDome "滑到右"型滑块。
+// JS 合成事件被 DataDome 凭 event.isTrusted=false 拒，必须走 Input.dispatchMouseEvent 才能发"浏览器级真事件"。
+// 入参 sliderRect / targetRect 是滑块所在 iframe 的视口坐标；这里要先在 top 帧里
+// 找到对应的 captcha iframe，把它的 offset 加上才能得到 top 标签视口的最终坐标。
+async function attemptDataDomeSlideCaptchaViaCdp({ tabId, frameUrl, sliderRect, targetRect }) {
+  if (!chrome.debugger?.attach) {
+    throw new Error('chrome.debugger 不可用，无法使用 CDP 拖动 DataDome 滑块。');
+  }
+  if (!tabId) {
+    throw new Error('CDP DataDome 滑块缺少 tabId。');
+  }
+  if (!sliderRect || !targetRect) {
+    throw new Error('CDP DataDome 滑块缺少坐标信息。');
+  }
+
+  const target = { tabId };
+  try {
+    await chrome.debugger.attach(target, '1.3');
+  } catch (err) {
+    throw new Error(
+      `DataDome 滑块 CDP 附加调试器失败：${err?.message || err}。如该标签已打开 DevTools 请先关闭。`
+    );
+  }
+
+  try {
+    // 在 top 帧里枚举 iframe，找到 captcha iframe 的位置（getBoundingClientRect）。
+    // DataDome 的 iframe 永远是 captcha-delivery.com / *.ddc.paypal.com 域名。
+    const offsetEval = await chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
+      expression: `(() => {
+        const wantUrl = ${JSON.stringify(String(frameUrl || ''))};
+        const iframes = Array.from(document.querySelectorAll('iframe'));
+        for (const iframe of iframes) {
+          const src = iframe.src || iframe.getAttribute('src') || '';
+          const matchExact = wantUrl && src === wantUrl;
+          const matchOrigin = /^https:\\/\\/(?:[a-z0-9-]+\\.)*(?:ddc\\.paypal\\.com|captcha-delivery\\.com)\\//i.test(src);
+          if (matchExact || matchOrigin) {
+            const rect = iframe.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+              return JSON.stringify({
+                left: rect.left,
+                top: rect.top,
+                width: rect.width,
+                height: rect.height,
+                src,
+              });
+            }
+          }
+        }
+        return '';
+      })()`,
+      returnByValue: true,
+      awaitPromise: false,
+    });
+
+    const offsetText = String(offsetEval?.result?.value || '');
+    if (!offsetText) {
+      throw new Error('未能在 top frame 中定位 DataDome 验证码 iframe，无法计算坐标。');
+    }
+    const iframeOffset = JSON.parse(offsetText);
+
+    const localStartX = sliderRect.left + sliderRect.width / 2;
+    const localStartY = sliderRect.top + sliderRect.height / 2;
+    const localEndX = targetRect.left + targetRect.width / 2;
+    const localEndY = localStartY;
+
+    const startX = iframeOffset.left + localStartX;
+    const startY = iframeOffset.top + localStartY;
+    const endX = iframeOffset.left + localEndX;
+    const endY = iframeOffset.top + localEndY;
+
+    console.log(LOG_PREFIX, '[paypal-dd-captcha] CDP drag ' + JSON.stringify({
+      iframeOffset,
+      start: { x: startX, y: startY },
+      end: { x: endX, y: endY },
+      localSliderRect: sliderRect,
+      localTargetRect: targetRect,
+    }));
+
+    await chrome.debugger.sendCommand(target, 'Page.bringToFront').catch(() => { });
+
+    // 入场：先用 mouseMoved（button: 'none'）走到起点上空，模拟人手悬停
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: startX,
+      y: startY,
+      button: 'none',
+      buttons: 0,
+      clickCount: 0,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80 + Math.random() * 80));
+
+    // 按下
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: startX,
+      y: startY,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+    });
+
+    // 主拖动：ease-in-out + Y 轴正弦/随机抖动
+    const stepCount = 32 + Math.floor(Math.random() * 12);
+    const totalDuration = 850 + Math.random() * 550;
+    const easeInOut = (t) => (t < 0.5 ? 4 * t * t * t : 1 - ((-2 * t + 2) ** 3) / 2);
+    const dx = endX - startX;
+    const stepDelay = totalDuration / stepCount;
+    for (let i = 1; i <= stepCount; i += 1) {
+      const linear = i / stepCount;
+      const eased = easeInOut(linear);
+      const x = startX + dx * eased;
+      const yJitter = Math.sin(linear * Math.PI * 3) * 3 + (Math.random() - 0.5) * 1.5;
+      const y = startY + yJitter;
+      await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+        type: 'mouseMoved',
+        x,
+        y,
+        button: 'left',
+        buttons: 1,
+        clickCount: 0,
+      });
+      await new Promise((resolve) => setTimeout(resolve, stepDelay + (Math.random() - 0.5) * 6));
+    }
+
+    // 收尾：在 endX 附近做 3-4 帧微抖动模拟"手停下来"
+    const settleFrames = 3 + Math.floor(Math.random() * 2);
+    for (let i = 0; i < settleFrames; i += 1) {
+      await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+        type: 'mouseMoved',
+        x: endX + (Math.random() - 0.5) * 0.8,
+        y: endY + (Math.random() - 0.5) * 0.8,
+        button: 'left',
+        buttons: 1,
+        clickCount: 0,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50 + Math.random() * 35));
+    }
+
+    // 手指在终点再"想一下"再松开
+    await new Promise((resolve) => setTimeout(resolve, 120 + Math.random() * 100));
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: endX,
+      y: endY,
+      button: 'left',
+      buttons: 0,
+      clickCount: 1,
+    });
+  } finally {
+    await chrome.debugger.detach(target).catch(() => { });
+  }
+}
+
+// 给 content/paypal-datadome-captcha.js 用：iframe 里的脚本检测到滑块后通过此消息
+// 把坐标发回来，由 background 走 CDP 派发真鼠标事件。
+// （监听器统一在下面 chrome.runtime.onMessage.addListener 里短路处理；
+// 不再单独注册一个 listener，否则会和 messageRouter 的同步错误响应抢先 sendResponse。）
+
 async function broadcastStopToContentScripts() {
   const registry = await getTabRegistry();
   for (const entry of Object.values(registry)) {
@@ -10732,6 +10925,27 @@ let stopRequested = false;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   console.log(LOG_PREFIX, `Received: ${message.type} from ${message.source || 'sidepanel'}`, message);
+
+  // PAYPAL_DATADOME_SLIDE_REQUEST 由 content/paypal-datadome-captcha.js 在 DataDome iframe 里发起，
+  // 这里短路掉，不要再交给 messageRouter（它没注册这个类型会立刻同步返回 Unknown，
+  // 抢在 CDP 拖动完成之前把失败响应发回去；content script 误判失败后又立刻重试，
+  // 一次 captcha 引发多次叠加 CDP 拖动，反而被 DataDome 当机器人）。
+  if (message?.type === 'PAYPAL_DATADOME_SLIDE_REQUEST') {
+    const tabId = sender?.tab?.id;
+    if (!Number.isInteger(tabId)) {
+      sendResponse({ ok: false, error: 'PAYPAL_DATADOME_SLIDE_REQUEST 缺少 tabId。' });
+      return false;
+    }
+    attemptDataDomeSlideCaptchaViaCdp({
+      tabId,
+      frameUrl: String(message.payload?.frameUrl || ''),
+      sliderRect: message.payload?.sliderRect,
+      targetRect: message.payload?.targetRect,
+    })
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
 
   handleMessage(message, sender).then(response => {
     sendResponse(response);
@@ -12550,6 +12764,8 @@ const autoRunController = self.MultiPageBackgroundAutoRunController?.createAutoR
   isGpcTaskEndedFailure,
   isHostedCheckoutGenericErrorFailure,
   isHostedCheckoutVerificationResendLimitFailure,
+  isHostedCheckoutSlideCaptchaFailedFailure,
+  isLocalCpaJsonExportFailedFailure,
   isRestartCurrentAttemptError,
   isStep4Route405RecoveryLimitFailure,
   isSignupUserAlreadyExistsFailure,

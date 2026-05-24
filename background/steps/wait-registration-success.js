@@ -4,6 +4,9 @@
   const DEFAULT_REGISTRATION_SUCCESS_WAIT_MS = 4000;
   const LOCAL_CPA_JSON_NO_RT_PANEL_MODE = 'local-cpa-json-no-rt';
   const LOCAL_CPA_JSON_EXPORT_NODE_ID = 'local-cpa-json-export';
+  const LOCAL_CPA_JSON_EXPORT_FAILED_PREFIX = 'LOCAL_CPA_JSON_EXPORT_FAILED::';
+  const LOCAL_CPA_JSON_EXPORT_MAX_ATTEMPTS = 3;
+  const LOCAL_CPA_JSON_EXPORT_RETRY_BASE_DELAY_MS = 5000;
   const CHATGPT_SESSION_EXPORT_URL = 'https://chatgpt.com/';
   const STEP6_COOKIE_CLEAR_DOMAINS = [
     'chatgpt.com',
@@ -314,11 +317,16 @@
       }
 
       const saved = await saveLocalCpaJsonArtifactViaHelper(helperBaseUrl, artifact);
-      const verifiedStatus = `本地CPA JSON 无RT 已导出：${saved.filePath}`;
+      const savedFilePath = normalizeString(saved?.filePath);
+      if (!savedFilePath) {
+        // 本地助手意外返回 ok=true 但缺少 filePath；视为静默失败，不允许流程继续。
+        throw new Error('本地 helper 未返回 CPA JSON 实际保存路径，无法确认导出已落地。');
+      }
+      const verifiedStatus = `本地CPA JSON 无RT 已导出：${savedFilePath}`;
       await addLog(`步骤 ${visibleStep}：${verifiedStatus}`, 'ok');
       return {
         verifiedStatus,
-        localCpaJsonFilePath: saved.filePath,
+        localCpaJsonFilePath: savedFilePath,
       };
     }
 
@@ -376,8 +384,46 @@
       }
       await addLog('步骤 7：Plus Checkout 已完成，等待 5 秒后导出本地 CPA JSON 无RT...', 'info');
       await sleepWithStop(5000);
-      const completionPayload = await exportLocalCpaJsonNoRt(state, { visibleStep: 7 });
-      await completeNodeFromBackground(LOCAL_CPA_JSON_EXPORT_NODE_ID, completionPayload);
+
+      let lastError = null;
+      for (let attempt = 1; attempt <= LOCAL_CPA_JSON_EXPORT_MAX_ATTEMPTS; attempt += 1) {
+        try {
+          const completionPayload = await exportLocalCpaJsonNoRt(state, { visibleStep: 7 });
+          if (attempt > 1) {
+            await addLog(
+              `步骤 7：本地 CPA JSON 导出在第 ${attempt}/${LOCAL_CPA_JSON_EXPORT_MAX_ATTEMPTS} 次尝试中成功。`,
+              'ok'
+            );
+          }
+          await completeNodeFromBackground(LOCAL_CPA_JSON_EXPORT_NODE_ID, completionPayload);
+          return;
+        } catch (error) {
+          lastError = error;
+          const message = getErrorMessage(error);
+          if (attempt < LOCAL_CPA_JSON_EXPORT_MAX_ATTEMPTS) {
+            const delayMs = LOCAL_CPA_JSON_EXPORT_RETRY_BASE_DELAY_MS * attempt;
+            await addLog(
+              `步骤 7：本地 CPA JSON 导出失败（${attempt}/${LOCAL_CPA_JSON_EXPORT_MAX_ATTEMPTS}）：${message}；${Math.round(delayMs / 1000)} 秒后重试。`,
+              'warn'
+            );
+            try {
+              await sleepWithStop(delayMs);
+            } catch (sleepError) {
+              // 用户手动停止时把停止错误向上抛出。
+              throw sleepError;
+            }
+            continue;
+          }
+          break;
+        }
+      }
+
+      const finalMessage = getErrorMessage(lastError) || '本地 CPA JSON 导出失败。';
+      await addLog(
+        `步骤 7：本地 CPA JSON 导出连续 ${LOCAL_CPA_JSON_EXPORT_MAX_ATTEMPTS} 次失败，已达到自动重试上限：${finalMessage}`,
+        'error'
+      );
+      throw new Error(`${LOCAL_CPA_JSON_EXPORT_FAILED_PREFIX}${finalMessage}`);
     }
 
     return {

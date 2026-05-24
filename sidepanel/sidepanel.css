@@ -1565,6 +1565,84 @@ header {
   font-weight: 600;
 }
 
+.luckmail-item.is-disabled {
+  border-color: var(--warn, #d97706);
+  background: var(--warn-soft, rgba(217, 119, 6, 0.06));
+}
+
+.hosted-sms-pool-cooldown {
+  font-variant-numeric: tabular-nums;
+}
+
+.hosted-sms-pool-unavailable {
+  font-variant-numeric: tabular-nums;
+}
+
+.hosted-sms-pool-manual-code-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.hosted-sms-pool-manual-code-label {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.hosted-sms-pool-manual-code {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  padding: 2px 10px;
+  border-radius: 6px;
+  border: 1px dashed var(--border);
+  background: var(--bg-elevated, var(--bg-base));
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.hosted-sms-pool-manual-code:hover {
+  border-color: var(--blue);
+  color: var(--blue);
+}
+
+.hosted-sms-pool-url-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.hosted-sms-pool-url-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-all;
+}
+
+.hosted-sms-pool-manual-code-meta {
+  margin-top: 4px;
+}
+
+.hosted-sms-pool-manual-code-time {
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.hosted-sms-pool-manual-code-time--fresh {
+  color: var(--ok, #16a34a);
+}
+
+.hosted-sms-pool-manual-code-time--muted {
+  color: var(--text-muted);
+}
+
+.hosted-sms-pool-manual-code-time--warn {
+  color: var(--warn, #d97706);
+  font-weight: 600;
+}
+
 .luckmail-tag {
   display: inline-flex;
   align-items: center;
