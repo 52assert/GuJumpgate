@@ -141,3 +141,72 @@ test('manual hosted checkout code fetch ignores 6-digit year-month pulled from Y
     /暂未返回有效验证码/
   );
 });
+
+test('hosted checkout runtime prefers PayPal SMS pool entry over fallback phone config', async () => {
+  const state = {
+    plusPaymentMethod: 'paypal',
+    plusHostedCheckoutIsFinalStep: true,
+    hostedCheckoutPhoneNumber: '9999999999',
+    hostedCheckoutVerificationUrl: 'https://fallback.example.test/code',
+    hostedCheckoutSmsPoolText: '4155552671----https://pool.example.test/code',
+    hostedCheckoutSmsPoolUsage: {},
+  };
+  const logs = [];
+  const requestedUrls = [];
+  const executor = globalThis.MultiPageBackgroundPlusCheckoutCreate.createPlusCheckoutCreateExecutor({
+    addLog: async (message) => logs.push(String(message)),
+    chrome: {
+      storage: {
+        local: {
+          get: async () => ({}),
+        },
+      },
+    },
+    fetch: async (url) => {
+      requestedUrls.push(String(url));
+      return {
+        text: async () => "yes|PayPal: 201412 is your security code. Don't share it.",
+        json: async () => ({}),
+      };
+    },
+    getState: async () => state,
+    setState: async (patch) => {
+      Object.assign(state, patch);
+    },
+  });
+
+  await executor.fetchHostedCheckoutVerificationCodeManually();
+
+  assert(logs.some((line) => line.includes('PayPal 接码池已选择号码 4155552671')));
+  assert.equal(requestedUrls[0], 'https://pool.example.test/code');
+});
+
+test('hosted checkout automation does not fall back to static phone when configured SMS pool has no usable entries', async () => {
+  const state = {
+    hostedCheckoutPhoneNumber: '9999999999',
+    hostedCheckoutSmsPoolText: 'bad-pool-data-without-url',
+    hostedCheckoutSmsPoolUsage: {},
+  };
+  const executor = globalThis.MultiPageBackgroundPlusCheckoutCreate.createPlusCheckoutCreateExecutor({
+    chrome: {
+      storage: {
+        local: {
+          get: async () => ({}),
+        },
+      },
+    },
+    fetch: async () => ({
+      text: async () => 'no|暂无验证码',
+      json: async () => ({}),
+    }),
+    getState: async () => state,
+    setState: async (patch) => {
+      Object.assign(state, patch);
+    },
+  });
+
+  await assert.rejects(
+    () => executor.fetchHostedCheckoutVerificationCodeManually(),
+    /PayPal 接码池已填写，但未识别到有效号码/
+  );
+});

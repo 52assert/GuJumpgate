@@ -54,6 +54,7 @@ test('phone bind-email reuses current Hotmail account without marking it during 
   assert.equal(ensureCalls.length, 1);
   assert.equal(ensureCalls[0].preferredAccountId, 'hotmail-1');
   assert.equal(ensureCalls[0].allowUsedCurrent, true);
+  assert.equal(ensureCalls[0].allowPendingVerification, true);
   assert.equal(ensureCalls[0].markUsed, false);
   assert.equal(persistedEmails.length, 1);
   assert.equal(persistedEmails[0].email, 'base+fp1@outlook.com');

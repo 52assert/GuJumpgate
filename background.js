@@ -17,6 +17,7 @@ importScripts(
   'phone-sms/providers/grizzlysms.js',
   'phone-sms/providers/smspool.js',
   'phone-sms/providers/chatgpt-api.js',
+  'phone-sms/providers/zhusms.js',
   'phone-sms/providers/registry.js',
   'background/phone-verification-flow.js',
   'background/account-run-history.js',
@@ -639,6 +640,8 @@ const PHONE_SMS_PROVIDER_SMS_VERIFICATION_NUMBER = 'sms-verification-number';
 const PHONE_SMS_PROVIDER_GRIZZLYSMS = 'grizzlysms';
 const PHONE_SMS_PROVIDER_SMSPOOL = 'smspool';
 const PHONE_SMS_PROVIDER_CHATGPT_API = 'chatgpt-api';
+const PHONE_SMS_PROVIDER_ZHUSMS = 'zhusms';
+const PHONE_SMS_PROVIDER_MANUAL = 'manual';
 const DEFAULT_PHONE_SMS_PROVIDER = PHONE_SMS_PROVIDER_HERO;
 const DEFAULT_PHONE_SMS_PROVIDER_ORDER = Object.freeze([
   PHONE_SMS_PROVIDER_HERO,
@@ -649,6 +652,7 @@ const DEFAULT_PHONE_SMS_PROVIDER_ORDER = Object.freeze([
   PHONE_SMS_PROVIDER_GRIZZLYSMS,
   PHONE_SMS_PROVIDER_SMSPOOL,
   PHONE_SMS_PROVIDER_CHATGPT_API,
+  PHONE_SMS_PROVIDER_ZHUSMS,
 ]);
 const DEFAULT_FIVE_SIM_BASE_URL = 'https://5sim.net/v1';
 const DEFAULT_FIVE_SIM_PRODUCT = 'openai';
@@ -667,6 +671,9 @@ const DEFAULT_SMSPOOL_BASE_URL = 'https://api.smspool.net/stubs/handler_api.php?
 const DEFAULT_SMSPOOL_SERVICE_CODE = '671';
 const DEFAULT_SMSPOOL_COUNTRY_ID = 1;
 const DEFAULT_SMSPOOL_COUNTRY_LABEL = 'United States';
+const DEFAULT_ZHUSMS_BASE_URL = 'https://zhusms.com';
+const DEFAULT_ZHUSMS_PROXY_BASE_URL = DEFAULT_HOTMAIL_LOCAL_BASE_URL;
+const DEFAULT_ZHUSMS_SERVICE_CODE = 'codex';
 const DEFAULT_HERO_SMS_REUSE_ENABLED = true;
 const HERO_SMS_ACQUIRE_PRIORITY_COUNTRY = 'country';
 const HERO_SMS_ACQUIRE_PRIORITY_PRICE = 'price';
@@ -1041,6 +1048,7 @@ const PERSISTED_SETTING_DEFAULTS = {
   plusPaymentMethod: DEFAULT_PLUS_PAYMENT_METHOD,
   plusAccountAccessStrategy: PLUS_ACCOUNT_ACCESS_STRATEGY_OAUTH,
   plusHostedCheckoutOauthDelaySeconds: 10,
+  hostedCheckoutAutoClosePayReturnEnabled: false,
   plusCheckoutCloudConversionEnabled: false,
   plusCheckoutCloudConversionApiUrl: BUILTIN_PLUS_CHECKOUT_CLOUD_CONVERSION_API_URL,
   plusCheckoutCloudConversionApiKey: BUILTIN_PLUS_CHECKOUT_CLOUD_CONVERSION_API_KEY,
@@ -1137,6 +1145,7 @@ const PERSISTED_SETTING_DEFAULTS = {
   mail2925UseAccountPool: false,
   emailGenerator: 'duck',
   customMailProviderPool: [],
+  customMailProviderPoolEntries: [],
   customEmailPool: [],
   customEmailPoolEntries: [],
   autoDeleteUsedIcloudAlias: false,
@@ -1243,6 +1252,10 @@ const PERSISTED_SETTING_DEFAULTS = {
   smsPoolMinPrice: '',
   smsPoolMaxPrice: '',
   smsPoolPreferredPrice: '',
+  zhuSmsSid: '',
+  zhuSmsBaseUrl: DEFAULT_ZHUSMS_BASE_URL,
+  zhuSmsProxyBaseUrl: DEFAULT_ZHUSMS_PROXY_BASE_URL,
+  zhuSmsServiceCode: DEFAULT_ZHUSMS_SERVICE_CODE,
   phonePreferredActivation: null,
 };
 
@@ -1867,6 +1880,12 @@ function normalizePhoneSmsProvider(value = '') {
   if (normalized === PHONE_SMS_PROVIDER_CHATGPT_API) {
     return PHONE_SMS_PROVIDER_CHATGPT_API;
   }
+  if (normalized === PHONE_SMS_PROVIDER_ZHUSMS) {
+    return PHONE_SMS_PROVIDER_ZHUSMS;
+  }
+  if (normalized === PHONE_SMS_PROVIDER_MANUAL) {
+    return PHONE_SMS_PROVIDER_MANUAL;
+  }
   return PHONE_SMS_PROVIDER_HERO_SMS;
 }
 function normalizePhoneSmsProviderOrder(value = [], fallbackOrder = []) {
@@ -1889,6 +1908,9 @@ function normalizePhoneSmsProviderOrder(value = [], fallbackOrder = []) {
         ? (entry.provider || entry.id || entry.value || '')
         : entry
     );
+    if (provider === PHONE_SMS_PROVIDER_MANUAL) {
+      return;
+    }
     if (!provider || seen.has(provider)) {
       return;
     }
@@ -1907,6 +1929,9 @@ function normalizePhoneSmsProviderOrder(value = [], fallbackOrder = []) {
         ? (entry.provider || entry.id || entry.value || '')
         : entry
     );
+    if (provider === PHONE_SMS_PROVIDER_MANUAL) {
+      return;
+    }
     if (!provider || seen.has(provider)) {
       return;
     }
@@ -2629,6 +2654,86 @@ function getCustomEmailPoolEntries(state = {}) {
   }));
 }
 
+function getCustomMailProviderPoolEntries(state = {}) {
+  const entries = normalizeCustomEmailPoolEntryObjects(state?.customMailProviderPoolEntries);
+  if (entries.length > 0) {
+    return entries;
+  }
+  return normalizeCustomEmailPool(state?.customMailProviderPool).map((email) => ({
+    id: `custom-mail-provider-pool-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+    email,
+    enabled: true,
+    used: false,
+    note: '',
+    lastUsedAt: 0,
+  }));
+}
+
+function getActiveCustomMailProviderPoolEntries(state = {}) {
+  return getCustomMailProviderPoolEntries(state)
+    .filter((entry) => entry.enabled && !entry.used);
+}
+
+async function markCurrentCustomMailProviderPoolEntryUsed(state = {}, options = {}) {
+  if (String(state?.mailProvider || '').trim().toLowerCase() !== 'custom') {
+    return { updated: false };
+  }
+
+  const currentEmail = String(state?.email || '').trim().toLowerCase();
+  if (!currentEmail) {
+    return { updated: false };
+  }
+
+  const entries = getCustomMailProviderPoolEntries(state);
+  if (!entries.length) {
+    return { updated: false };
+  }
+
+  let changed = false;
+  const now = Date.now();
+  const nextEntries = entries.map((entry) => {
+    if (entry.email !== currentEmail) {
+      return entry;
+    }
+    if (entry.used && entry.lastUsedAt) {
+      return entry;
+    }
+    changed = true;
+    return {
+      ...entry,
+      used: true,
+      lastUsedAt: now,
+    };
+  });
+
+  if (!changed) {
+    return { updated: false };
+  }
+
+  const nextCustomMailProviderPool = nextEntries
+    .filter((entry) => entry.enabled && !entry.used)
+    .map((entry) => entry.email);
+  await setPersistentSettings({
+    customMailProviderPoolEntries: nextEntries,
+    customMailProviderPool: nextCustomMailProviderPool,
+  });
+  await setState({
+    customMailProviderPoolEntries: nextEntries,
+    customMailProviderPool: nextCustomMailProviderPool,
+  });
+  broadcastDataUpdate({
+    customMailProviderPoolEntries: nextEntries,
+    customMailProviderPool: nextCustomMailProviderPool,
+  });
+  const logPrefix = String(options.logPrefix || '').trim() || '自定义邮箱号池：流程成功后';
+  await addLog(`${logPrefix}已将 ${currentEmail} 标记为已用。`, options.level || 'ok');
+  return {
+    updated: true,
+    customMailProviderPoolEntries: nextEntries,
+    customMailProviderPool: nextCustomMailProviderPool,
+  };
+}
+
 async function markCurrentCustomEmailPoolEntryUsed(state = {}, options = {}) {
   if (!isCustomEmailPoolGenerator(state)) {
     return { updated: false };
@@ -2774,6 +2879,14 @@ async function markCurrentRegistrationAccountUsed(state = {}, options = {}) {
     updated = Boolean(result?.updated) || updated;
   }
 
+  if (typeof markCurrentCustomMailProviderPoolEntryUsed === 'function') {
+    const result = await markCurrentCustomMailProviderPoolEntryUsed(latestState, {
+      logPrefix: `${reasonPrefix}：自定义邮箱号池`,
+      level: options.level || 'warn',
+    });
+    updated = Boolean(result?.updated) || updated;
+  }
+
   return { updated };
 }
 
@@ -2878,6 +2991,39 @@ async function markCurrentRegistrationAccountUnavailable(state = {}, options = {
     updated = Boolean(result?.updated) || updated;
   }
 
+  if (typeof markCurrentCustomMailProviderPoolEntryUsed === 'function') {
+    const result = await markCurrentCustomMailProviderPoolEntryUsed(latestState, {
+      logPrefix: `${reasonPrefix}：自定义邮箱号池`,
+      level: options.level || 'warn',
+    });
+    updated = Boolean(result?.updated) || updated;
+  }
+
+  if (updated) {
+    const clearUpdates = buildRegistrationEmailStateUpdates(latestState, {
+      currentEmail: '',
+      preservePrevious: true,
+      source: 'identity_conflict',
+    });
+    await setState({
+      ...clearUpdates,
+      step8VerificationTargetEmail: '',
+      bindEmailSubmitted: false,
+      ...(latestState.currentHotmailAccountId && isHotmailProvider(latestState)
+        ? { currentHotmailAccountId: null }
+        : {}),
+    });
+    broadcastDataUpdate({
+      ...clearUpdates,
+      step8VerificationTargetEmail: '',
+      bindEmailSubmitted: false,
+      ...(latestState.currentHotmailAccountId && isHotmailProvider(latestState)
+        ? { currentHotmailAccountId: null }
+        : {}),
+    });
+    await addLog(`${reasonPrefix}：已清空当前绑定邮箱运行态，下次将重新分配邮箱。`, options.level || 'warn');
+  }
+
   return { updated };
 }
 
@@ -2888,6 +3034,14 @@ function getCustomEmailPoolEmailForRun(state = {}, targetRun = 1) {
 }
 
 function getCustomMailProviderPool(state = {}) {
+  const entries = getActiveCustomMailProviderPoolEntries(state);
+  if (entries.length > 0) {
+    return entries.map((entry) => entry.email);
+  }
+  const allEntries = getCustomMailProviderPoolEntries(state);
+  if (allEntries.length > 0) {
+    return [];
+  }
   return normalizeCustomEmailPool(state?.customMailProviderPool);
 }
 
@@ -3340,6 +3494,8 @@ function normalizePersistentSettingValue(key, value) {
         value,
         PERSISTED_SETTING_DEFAULTS.plusHostedCheckoutOauthDelaySeconds
       );
+    case 'hostedCheckoutAutoClosePayReturnEnabled':
+      return Boolean(value);
     case 'plusCheckoutCloudConversionEnabled':
       return Boolean(value);
     case 'plusCheckoutCloudConversionApiUrl':
@@ -3641,16 +3797,7 @@ function normalizePersistentSettingValue(key, value) {
     case 'phoneCodePollMaxRounds':
       return normalizePhoneCodePollMaxRounds(value, DEFAULT_PHONE_CODE_POLL_ROUNDS);
     case 'mailProvider':
-      {
-        const normalizedMailProvider = normalizeMailProvider(value);
-        if (normalizedMailProvider === CLOUDFLARE_TEMP_EMAIL_PROVIDER) {
-          return CLOUDFLARE_TEMP_EMAIL_PROVIDER;
-        }
-        if (normalizedMailProvider === CLOUD_MAIL_PROVIDER) {
-          return CLOUD_MAIL_PROVIDER;
-        }
-        return HOTMAIL_PROVIDER;
-      }
+      return normalizeMailProvider(value);
     case 'mail2925Mode':
       return normalizeMail2925Mode(value);
     case 'mail2925UseAccountPool':
@@ -3660,6 +3807,7 @@ function normalizePersistentSettingValue(key, value) {
     case 'customMailProviderPool':
     case 'customEmailPool':
       return normalizeCustomEmailPool(value);
+    case 'customMailProviderPoolEntries':
     case 'customEmailPoolEntries':
       return normalizeCustomEmailPoolEntryObjects(value);
     case 'autoDeleteUsedIcloudAlias':
@@ -3885,6 +4033,22 @@ function normalizePersistentSettingValue(key, value) {
     case 'smsPoolMaxPrice':
     case 'smsPoolPreferredPrice':
       return normalizeHeroSmsMaxPrice(value);
+    case 'zhuSmsSid':
+      return self.PhoneSmsZhuSmsProvider?.normalizeZhuSmsSid
+        ? self.PhoneSmsZhuSmsProvider.normalizeZhuSmsSid(value)
+        : String(value || '').trim().replace(/^zhusms_sid\s*=\s*/i, '').split(';')[0].trim();
+    case 'zhuSmsBaseUrl':
+      return self.PhoneSmsZhuSmsProvider?.normalizeZhuSmsBaseUrl
+        ? self.PhoneSmsZhuSmsProvider.normalizeZhuSmsBaseUrl(value)
+        : normalizeUrl(value, DEFAULT_ZHUSMS_BASE_URL).replace(/\/+$/, '');
+    case 'zhuSmsProxyBaseUrl':
+      return self.PhoneSmsZhuSmsProvider?.normalizeZhuSmsProxyBaseUrl
+        ? self.PhoneSmsZhuSmsProvider.normalizeZhuSmsProxyBaseUrl(value)
+        : normalizeHotmailLocalBaseUrl(value || DEFAULT_ZHUSMS_PROXY_BASE_URL);
+    case 'zhuSmsServiceCode':
+      return self.PhoneSmsZhuSmsProvider?.normalizeZhuSmsServiceCode
+        ? self.PhoneSmsZhuSmsProvider.normalizeZhuSmsServiceCode(value, DEFAULT_ZHUSMS_SERVICE_CODE)
+        : normalizeNexSmsServiceCode(value, DEFAULT_ZHUSMS_SERVICE_CODE);
     case 'phonePreferredActivation':
       return normalizePhonePreferredActivation(value);
     default:
@@ -5446,6 +5610,7 @@ async function ensureHotmailAccountForFlow(options = {}) {
     preferredAccountId = null,
     excludeIds = [],
     allowUsedCurrent = false,
+    allowPendingVerification = false,
   } = options;
   const state = await getState();
   const accounts = normalizeHotmailAccounts(state.hotmailAccounts);
@@ -5461,6 +5626,13 @@ async function ensureHotmailAccountForFlow(options = {}) {
     && !excludedAccountIds.has(candidate.id)
     && !isAliasCapacityExhausted(candidate, state)
   ));
+  const pendingAccounts = allowPendingVerification
+    ? accounts.filter((candidate) => (
+      isPendingHotmailVerificationCandidate(candidate)
+      && !excludedAccountIds.has(candidate.id)
+      && !isAliasCapacityExhausted(candidate, state)
+    ))
+    : [];
   const isReusableAuthorizedHotmailAccount = (account) => Boolean(account)
     && account.status === 'authorized'
     && Boolean(account.refreshToken);
@@ -5484,6 +5656,9 @@ async function ensureHotmailAccountForFlow(options = {}) {
     for (const candidate of availableAccounts.slice().sort(compareHotmailAccountAllocationPriority)) {
       addCandidate(candidate);
     }
+    for (const candidate of pendingAccounts.slice().sort(compareHotmailAccountAllocationPriority)) {
+      addCandidate(candidate);
+    }
   }
 
   let lastAllocationError = null;
@@ -5491,16 +5666,28 @@ async function ensureHotmailAccountForFlow(options = {}) {
     if (!candidate) {
       continue;
     }
-    if (!isAuthorizedHotmailRunAccount(candidate) && !(allowUsedCurrent && isReusableAuthorizedHotmailAccount(candidate))) {
-      lastAllocationError = new Error(`Hotmail 账号 ${candidate.email || candidate.id} 尚未就绪，无法读取邮件。`);
+    let allocationCandidate = candidate;
+    if (allowPendingVerification && isPendingHotmailVerificationCandidate(allocationCandidate)) {
+      try {
+        await addLog(`Hotmail：正在校验待校验账号 ${allocationCandidate.email || allocationCandidate.id}，通过后用于当前流程。`, 'info');
+        const verificationResult = await verifyHotmailAccount(allocationCandidate.id);
+        allocationCandidate = verificationResult?.account || allocationCandidate;
+      } catch (error) {
+        lastAllocationError = error;
+        await addLog(`Hotmail：待校验账号 ${allocationCandidate.email || allocationCandidate.id} 校验失败：${error?.message || error}`, 'warn');
+        continue;
+      }
+    }
+    if (!isAuthorizedHotmailRunAccount(allocationCandidate) && !(allowUsedCurrent && isReusableAuthorizedHotmailAccount(allocationCandidate))) {
+      lastAllocationError = new Error(`Hotmail 账号 ${allocationCandidate.email || allocationCandidate.id} 尚未就绪，无法读取邮件。`);
       continue;
     }
-    if (!allowUsedCurrent && isAliasCapacityExhausted(candidate, state)) {
-      lastAllocationError = new Error(`Hotmail/Outlook 账号 ${candidate.email || candidate.id} 的别名已用完。`);
+    if (!allowUsedCurrent && isAliasCapacityExhausted(allocationCandidate, state)) {
+      lastAllocationError = new Error(`Hotmail/Outlook 账号 ${allocationCandidate.email || allocationCandidate.id} 的别名已用完。`);
       continue;
     }
     try {
-      const selectedAccount = await setCurrentHotmailAccount(candidate.id, { markUsed, syncEmail: false });
+      const selectedAccount = await setCurrentHotmailAccount(allocationCandidate.id, { markUsed, syncEmail: false });
       const aliasEmail = typeof ensureOutlookAliasForHotmailAccount === 'function'
         ? await ensureOutlookAliasForHotmailAccount(selectedAccount, options)
         : selectedAccount.email;
@@ -5510,14 +5697,14 @@ async function ensureHotmailAccountForFlow(options = {}) {
       };
     } catch (error) {
       lastAllocationError = error;
-      if (isAliasCapacityExhausted(candidate, await getState())) {
-        await patchHotmailAccount(candidate.id, {
+      if (isAliasCapacityExhausted(allocationCandidate, await getState())) {
+        await patchHotmailAccount(allocationCandidate.id, {
           used: true,
           lastUsedAt: Date.now(),
         }, {
           preserveCurrentSelection: true,
         });
-        await addLog(`Hotmail/Outlook：账号 ${candidate.email || candidate.id} 的别名额度已用完，已跳过该基邮箱。`, 'warn');
+        await addLog(`Hotmail/Outlook：账号 ${allocationCandidate.email || allocationCandidate.id} 的别名额度已用完，已跳过该基邮箱。`, 'warn');
       }
     }
   }
@@ -6006,9 +6193,112 @@ async function testHotmailAccountMailAccess(accountId) {
     throw new Error('未找到需要测试的 Hotmail 账号。');
   }
 
-  const result = await fetchHotmailMailboxMessages(account, HOTMAIL_MAILBOXES);
-  const latestMessage = getLatestHotmailMessage(result.messages);
-  const latestCode = latestMessage ? extractVerificationCodeFromMessage(latestMessage) : null;
+  function resolveManualHotmailCodeStep(currentState = {}) {
+    const nodeId = String(currentState?.currentNodeId || currentState?.nodeId || '').trim();
+    if (nodeId === 'fetch-signup-code') {
+      return 4;
+    }
+    if (
+      nodeId === 'fetch-login-code'
+      || nodeId === 'fetch-bind-email-code'
+      || nodeId === 'fetch-bound-email-login-code'
+      || nodeId === 'bind-email'
+    ) {
+      return Number(currentState?.visibleStep || currentState?.step) || 8;
+    }
+    return Number(currentState?.loginVerificationRequestedAt) ? 8 : 4;
+  }
+
+  function buildManualHotmailCodePollPayload(currentState = {}) {
+    const step = resolveManualHotmailCodeStep(currentState);
+    const flowPayload = typeof getVerificationPollPayload === 'function'
+      ? getVerificationPollPayload(step, currentState)
+      : {};
+    const hotmailConfig = getHotmailVerificationPollConfig(step) || {};
+    return {
+      ...flowPayload,
+      ...hotmailConfig,
+      step,
+      maxAttempts: Math.min(4, Math.max(1, Number(hotmailConfig.maxAttempts || flowPayload.maxAttempts || 4))),
+      intervalMs: Math.max(1000, Number(hotmailConfig.intervalMs || flowPayload.intervalMs || 3000)),
+    };
+  }
+
+  const pollPayload = buildManualHotmailCodePollPayload(state);
+  const maxAttempts = Number(pollPayload.maxAttempts) || 4;
+  const intervalMs = Number(pollPayload.intervalMs) || 3000;
+  let workingAccount = account;
+  let latestResult = null;
+  let latestMessage = null;
+  let lastError = null;
+  let matchResult = { match: null };
+
+  function pickManualHotmailCode(messages = []) {
+    const strictResult = pickVerificationMessageWithTimeFallback(messages, {
+      afterTimestamp: pollPayload.filterAfterTimestamp || 0,
+      senderFilters: pollPayload.senderFilters || [],
+      subjectFilters: pollPayload.subjectFilters || [],
+      requiredKeywords: pollPayload.requiredKeywords || [],
+      codePatterns: pollPayload.codePatterns || [],
+      excludeCodes: pollPayload.excludeCodes || [],
+    });
+    if (strictResult.match?.code) {
+      return strictResult;
+    }
+
+    const relaxedRecentMatch = pickVerificationMessage(messages, {
+      afterTimestamp: pollPayload.filterAfterTimestamp || 0,
+      codePatterns: pollPayload.codePatterns || [],
+      excludeCodes: pollPayload.excludeCodes || [],
+    });
+    if (relaxedRecentMatch?.code) {
+      return {
+        match: relaxedRecentMatch,
+        usedRelaxedFilters: true,
+        usedManualFallback: true,
+        usedTimeFallback: false,
+      };
+    }
+
+    const relaxedAnyTimeMatch = pickVerificationMessage(messages, {
+      afterTimestamp: 0,
+      codePatterns: pollPayload.codePatterns || [],
+      excludeCodes: pollPayload.excludeCodes || [],
+    });
+    return {
+      match: relaxedAnyTimeMatch || null,
+      usedRelaxedFilters: Boolean(relaxedAnyTimeMatch),
+      usedManualFallback: Boolean(relaxedAnyTimeMatch),
+      usedTimeFallback: Boolean(relaxedAnyTimeMatch),
+    };
+  }
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    throwIfStopped();
+    try {
+      const fetchResult = await fetchHotmailMailboxMessages(workingAccount, HOTMAIL_MAILBOXES);
+      workingAccount = fetchResult.account;
+      latestResult = fetchResult;
+      latestMessage = getLatestHotmailMessage(fetchResult.messages);
+      matchResult = pickManualHotmailCode(fetchResult.messages);
+
+      if (matchResult.match?.code) {
+        break;
+      }
+      lastError = new Error(`暂未在 Hotmail 中找到匹配验证码（${attempt}/${maxAttempts}）。`);
+    } catch (error) {
+      lastError = error;
+    }
+
+    if (attempt < maxAttempts) {
+      await sleepWithStop(intervalMs);
+    }
+  }
+
+  const result = latestResult || await fetchHotmailMailboxMessages(workingAccount, HOTMAIL_MAILBOXES);
+  const matchedMessage = matchResult.match?.message || null;
+  const latestCode = matchResult.match?.code || null;
+  const codeMailbox = matchedMessage?.mailbox || latestMessage?.mailbox || '';
 
   return {
     account: result.account,
@@ -6017,6 +6307,11 @@ async function testHotmailAccountMailAccess(accountId) {
     messageCount: result.messages.length,
     latestSubject: latestMessage?.subject || '',
     latestMailbox: latestMessage?.mailbox || '',
+    matchedSubject: matchedMessage?.subject || '',
+    matchedMailbox: codeMailbox,
+    usedManualFallback: Boolean(matchResult.usedManualFallback),
+    usedTimeFallback: Boolean(matchResult.usedTimeFallback),
+    lastError: lastError?.message || '',
     latestCode: latestCode || '',
     inboxCount: result.mailboxResults.find((item) => item.mailbox === 'INBOX')?.count || 0,
     junkCount: result.mailboxResults.find((item) => item.mailbox === 'Junk')?.count || 0,
@@ -10117,7 +10412,7 @@ function isSignupUserAlreadyExistsFailure(error) {
 
 function isStep8EmailInUseFailure(error) {
   const message = getErrorMessage(error);
-  return /STEP8_EMAIL_IN_USE::|email_in_use on add-email verification page/i.test(message);
+  return /STEP8_EMAIL_IN_USE::|email_(?:already_)?in_use|该邮箱地址已有关联账户|此邮箱地址已有关联账户|该电子邮件地址已有关联账户|email_in_use on add-email verification page/i.test(message);
 }
 
 function isRegistrationIdentityConflictFailure(error) {
@@ -10203,13 +10498,6 @@ function isPlusCheckoutRestartRequiredFailure(error) {
     && !isHostedCheckoutGenericErrorFailure(error)
     && !isHostedCheckoutVerificationResendLimitFailure(error)
     && !isCloudCheckoutAlreadyPaidFailure(error);
-}
-
-function shouldRetrySmsOauthNonFreeTrialFromStep7(state = {}, error = null) {
-  return isPlusCheckoutNonFreeTrialFailure(error)
-    && isPlusModeState(state)
-    && normalizePlusPaymentMethod(state?.plusPaymentMethod) === PLUS_PAYMENT_METHOD_PAYPAL
-    && normalizePlusAccountAccessStrategyForState(state) === PLUS_ACCOUNT_ACCESS_STRATEGY_SMS_OAUTH;
 }
 
 function isGoPayCheckoutRestartRequiredFailure(error) {
@@ -12807,6 +13095,29 @@ async function fetchDuckEmail(options = {}) {
 
 async function fetchGeneratedEmail(state, options = {}) {
   const currentState = state || await getState();
+  const provider = String(options.mailProvider || currentState.mailProvider || '').trim().toLowerCase();
+  if (provider === 'custom') {
+    const customMailProviderState = {
+      ...currentState,
+      ...(options.customMailProviderPool !== undefined
+        ? { customMailProviderPool: options.customMailProviderPool }
+        : {}),
+      ...(options.customMailProviderPoolEntries !== undefined
+        ? { customMailProviderPoolEntries: options.customMailProviderPoolEntries }
+        : {}),
+    };
+    const targetRun = Math.max(
+      1,
+      Math.floor(Number(options.poolIndex || customMailProviderState.autoRunCurrentRun || autoRunCurrentRun || 1) || 1)
+    );
+    const pooledEmail = getCustomMailProviderPoolEmailForRun(customMailProviderState, targetRun);
+    if (pooledEmail) {
+      await setEmailState(pooledEmail, { source: 'custom-mail-provider-pool' });
+      await addLog(`自定义邮箱号池：已取用 ${pooledEmail}`, 'ok');
+      return pooledEmail;
+    }
+    throw new Error('当前邮箱服务为自定义邮箱，但自定义号池为空，请直接填写注册邮箱或先配置自定义号池。');
+  }
   const generator = normalizeEmailGenerator(options.generator ?? currentState.emailGenerator);
   if (generator === CLOUD_MAIL_GENERATOR) {
     return fetchCloudMailAddress(currentState, options);
@@ -13992,20 +14303,6 @@ async function runAutoSequenceFromNodeGraph(startNodeId, context = {}) {
 
       const step = getDisplayStepForNode(nodeId, latestState);
       const nodeExecutionKey = getNodeExecutionKey(nodeId, latestState);
-      if (shouldRetrySmsOauthNonFreeTrialFromStep7(latestState, err)) {
-        plusCheckoutRestartCount += 1;
-        const checkoutCreateStep = getDisplayStepForNode('plus-checkout-create', latestState) || 7;
-        await addLog(
-          `节点 ${getNodeLabel(nodeId, latestState)}：先手机号注册 OAuth 检测到 Plus 今日应付金额非 0，将保留当前注册流程并直接回到第 ${checkoutCreateStep} 步 plus-checkout-create 重试（第 ${plusCheckoutRestartCount} 次）。原因：${getErrorMessage(err)}`,
-          'warn'
-        );
-        const checkoutResetAnchorNodeId = getPreviousNodeId('plus-checkout-create', latestState) || 'fill-profile';
-        await invalidateDownstreamAfterAutoRunNodeRestart(checkoutResetAnchorNodeId, {
-          logLabel: `先手机号注册 OAuth 非 0 金额后回到第 ${checkoutCreateStep} 步 plus-checkout-create 重试（第 ${plusCheckoutRestartCount} 次）`,
-        });
-        nodeIndex = Math.max(0, getNodeIndex(await getState(), 'plus-checkout-create'));
-        continue;
-      }
       const isGpcCheckoutStep = normalizePlusPaymentMethodForRun(latestState?.plusPaymentMethod) === plusPaymentMethodGpcHelper
         || String(latestState?.plusCheckoutSource || '').trim() === plusPaymentMethodGpcHelper;
       if (isPlusCheckoutRestartStep(step, nodeExecutionKey, latestState)
@@ -14026,15 +14323,15 @@ async function runAutoSequenceFromNodeGraph(startNodeId, context = {}) {
           ? 'GPC 任务'
           : (isGoPayCheckoutStep ? 'GoPay 订阅' : 'Plus Checkout');
         const recreateLabel = isGpcCheckoutStep
-          ? '重新创建 GPC 任务'
-          : (isGoPayCheckoutStep ? '重新创建 GoPay 订阅' : '重新创建 Plus Checkout');
+          ? '重新发起 GPC 任务'
+          : (isGoPayCheckoutStep ? '重新发起 GoPay 订阅' : '重新发起 Plus 支付链路');
         await addLog(
-          `节点 ${getNodeLabel(nodeId, latestState)}：检测到 ${checkoutLabel} 失败/卡住，准备回到节点 plus-checkout-create ${recreateLabel}（第 ${checkoutRestartCount} 次）。原因：${getErrorMessage(err)}`,
+          `节点 ${getNodeLabel(nodeId, latestState)}：检测到 ${checkoutLabel} 失败/卡住，准备重置支付链路并${recreateLabel}（第 ${checkoutRestartCount} 次）。原因：${getErrorMessage(err)}`,
           'warn'
         );
         const checkoutResetAnchorNodeId = getPreviousNodeId('plus-checkout-create', latestState) || 'fill-profile';
         await invalidateDownstreamAfterAutoRunNodeRestart(checkoutResetAnchorNodeId, {
-          logLabel: `节点 ${nodeId} ${checkoutLabel}失败后准备回到 plus-checkout-create 重试（第 ${checkoutRestartCount} 次）`,
+          logLabel: `节点 ${nodeId} ${checkoutLabel}失败后准备重置支付链路重试（第 ${checkoutRestartCount} 次）`,
         });
         nodeIndex = Math.max(0, getNodeIndex(await getState(), 'plus-checkout-create'));
         continue;
@@ -14047,11 +14344,11 @@ async function runAutoSequenceFromNodeGraph(startNodeId, context = {}) {
           throw err;
         }
         await addLog(
-          `节点 paypal-approve：检测到 GoPay 支付页失效/卡死，准备关闭旧页并回到节点 plus-checkout-create 重新创建 Checkout（第 ${goPayCheckoutRestartCount}/3 次）。原因：${getErrorMessage(err)}`,
+          `节点 paypal-approve：检测到 GoPay 支付页失效/卡死，准备关闭旧页并重置支付链路（第 ${goPayCheckoutRestartCount}/3 次）。原因：${getErrorMessage(err)}`,
           'warn'
         );
         await invalidateDownstreamAfterAutoRunNodeRestart(getPreviousNodeId('plus-checkout-create', latestState) || 'fill-profile', {
-          logLabel: `节点 paypal-approve GoPay 支付页失效后准备回到 plus-checkout-create 重试（第 ${goPayCheckoutRestartCount}/3 次）`,
+          logLabel: `节点 paypal-approve GoPay 支付页失效后准备重置支付链路重试（第 ${goPayCheckoutRestartCount}/3 次）`,
         });
         nodeIndex = Math.max(0, getNodeIndex(await getState(), 'plus-checkout-create'));
         continue;
@@ -14364,6 +14661,9 @@ const phoneVerificationHelpers = self.MultiPageBackgroundPhoneVerification?.crea
   DEFAULT_SMS_VERIFICATION_NUMBER_SERVICE_CODE,
   DEFAULT_SMSPOOL_BASE_URL,
   DEFAULT_SMSPOOL_SERVICE_CODE,
+  DEFAULT_ZHUSMS_BASE_URL,
+  DEFAULT_ZHUSMS_PROXY_BASE_URL,
+  DEFAULT_ZHUSMS_SERVICE_CODE,
   DEFAULT_HERO_SMS_BASE_URL,
   DEFAULT_HERO_SMS_REUSE_ENABLED,
   DEFAULT_PHONE_CODE_WAIT_SECONDS,
@@ -14394,6 +14694,14 @@ const phoneVerificationHelpers = self.MultiPageBackgroundPhoneVerification?.crea
       url: 'https://auth.openai.com/add-phone',
     };
   },
+  requestManualPhoneNumberInput: (payload = {}) => chrome.runtime.sendMessage({
+    type: 'REQUEST_MANUAL_PHONE_NUMBER_INPUT',
+    payload,
+  }),
+  requestManualPhoneCodeInput: (payload = {}) => chrome.runtime.sendMessage({
+    type: 'REQUEST_MANUAL_PHONE_CODE_INPUT',
+    payload,
+  }),
   generateRandomBirthday,
   generateRandomName,
   getOAuthFlowRemainingMs,
@@ -14414,6 +14722,7 @@ const phoneVerificationHelpers = self.MultiPageBackgroundPhoneVerification?.crea
   createSmsVerificationNumberProvider: self.PhoneSmsVerificationNumberProvider?.createProvider,
   createGrizzlySmsProvider: self.PhoneSmsGrizzlySmsProvider?.createProvider,
   createSmsPoolProvider: self.PhoneSmsPoolProvider?.createProvider,
+  createZhuSmsProvider: self.PhoneSmsZhuSmsProvider?.createProvider,
 });
 const step1Executor = self.MultiPageBackgroundStep1?.createStep1Executor({
   addLog,
@@ -15463,6 +15772,10 @@ async function getPostStep6AutoRestartDecision(step, error) {
     }
     return /HeroSMS|phone verification did not succeed|number replacements|sms_timeout_after(?:_[a-z0-9_]+)?|phone number is already linked|add-phone keeps rejecting current number|手机验证码|短信验证码|接码|步骤\s*9[：:][\s\S]*(?:手机号验证|手机验证码|接码|没有可用手机号|无可用手机号)|(?:手机号验证|手机号码验证|手机号接码|手机号码接码)[\s\S]*(?:失败|超时|未成功|不可用|拒绝)|(?:手机号|手机号码)[\s\S]*(?:已绑定|被占用|不可用|拒绝|失败|超时|没有可用|无可用)|Step\s*9.*phone verification/i.test(normalizedMessage);
   };
+  const isUnrecoverableMailResourceFailure = (errorMessage = '') => {
+    const normalizedMessage = String(errorMessage || '');
+    return /没有可用的\s*Hotmail\s*账号|请先在侧边栏添加至少一个带刷新令牌|Hotmail[\s\S]*(?:缺少|没有)[\s\S]*(?:refresh\s*token|刷新令牌)/i.test(normalizedMessage);
+  };
 
   const normalizedStep = Number(step);
   const errorMessage = getErrorMessage(error);
@@ -15493,6 +15806,17 @@ async function getPostStep6AutoRestartDecision(step, error) {
       ? boundEmailReloginStep
       : authChainStartStep);
   if (isPhoneSmsPlatformRateLimitFailure(errorMessage)) {
+    return {
+      shouldRestart: false,
+      blockedByAddPhone: false,
+      forcedByPhoneVerificationTimeout: false,
+      restartStep: authChainStartStep,
+      errorMessage,
+      authState: null,
+    };
+  }
+
+  if (isUnrecoverableMailResourceFailure(errorMessage)) {
     return {
       shouldRestart: false,
       blockedByAddPhone: false,

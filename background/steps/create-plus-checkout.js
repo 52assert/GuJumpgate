@@ -188,6 +188,27 @@
       return /(?:[?&#])redirect_status=pending(?:[&#]|$)/i.test(normalizedUrl);
     }
 
+    function isHostedCheckoutSucceededPayReturnUrl(url = '') {
+      const normalizedUrl = String(url || '').trim();
+      if (!normalizedUrl) {
+        return false;
+      }
+      try {
+        const parsed = new URL(normalizedUrl);
+        const hostname = String(parsed.hostname || '').trim().toLowerCase();
+        if (!['pay.openai.com', 'checkout.stripe.com'].includes(hostname)) {
+          return false;
+        }
+        if (!/^\/c\/pay(?:\/|$)/i.test(parsed.pathname || '')) {
+          return false;
+        }
+        return String(parsed.searchParams.get('redirect_status') || '').trim().toLowerCase() === 'succeeded';
+      } catch {
+        return /^https:\/\/(?:pay\.openai\.com|checkout\.stripe\.com)\/c\/pay(?:[/?#]|$)/i.test(normalizedUrl)
+          && /(?:[?&#])redirect_status=succeeded(?:[&#]|$)/i.test(normalizedUrl);
+      }
+    }
+
     function isPayPalUrl(url = '') {
       return /paypal\./i.test(String(url || ''));
     }
@@ -1118,7 +1139,7 @@ function FindProxyForURL(url, host) {
       }
       const normalizedUsage = normalizeHostedCheckoutSmsPoolUsage(usage);
       const now = Date.now();
-      const candidates = entries
+      return entries
         .map((entry, index) => {
           const itemUsage = normalizedUsage[entry.key] || {};
           const disabledUntil = Math.max(0, Number(itemUsage.disabledUntil) || 0);
@@ -1289,6 +1310,7 @@ function FindProxyForURL(url, host) {
         incrementFailureCount: false,
         failureCount: Math.max(0, Math.floor(Number(options.failureCount ?? previous.failureCount) || 0)),
         error: String(reason || '').trim(),
+        disabledUntil: 0,
         enabled: false,
         disabledReason: String(reason || '').trim(),
       });
@@ -1334,11 +1356,12 @@ function FindProxyForURL(url, host) {
           'hostedCheckoutVerificationPollIntervalSeconds',
         ]).catch(() => ({}));
       }
-      const poolEntries = parseHostedCheckoutSmsPoolEntries(
+      const rawSmsPoolText = String(
         stored?.hostedCheckoutSmsPoolText
         || state?.hostedCheckoutSmsPoolText
         || ''
-      );
+      ).trim();
+      const poolEntries = parseHostedCheckoutSmsPoolEntries(rawSmsPoolText);
       const poolUsage = normalizeHostedCheckoutSmsPoolUsage(
         stored?.hostedCheckoutSmsPoolUsage
         || state?.hostedCheckoutSmsPoolUsage
@@ -1365,6 +1388,26 @@ function FindProxyForURL(url, host) {
             'info'
           );
         }
+      }
+      if (ensureCurrentSmsEntry && rawSmsPoolText && !selectedSmsEntry) {
+        const now = Date.now();
+        let nearestDisabledUntil = 0;
+        const enabledCount = poolEntries.filter((entry) => {
+          const usage = poolUsage[entry.key] || {};
+          const disabledUntil = Math.max(0, Number(usage.disabledUntil) || 0);
+          if (disabledUntil > now && (nearestDisabledUntil === 0 || disabledUntil < nearestDisabledUntil)) {
+            nearestDisabledUntil = disabledUntil;
+          }
+          return isHostedCheckoutSmsPoolEntryEnabled(usage) && disabledUntil <= now;
+        }).length;
+        const waitSuffix = nearestDisabledUntil > now
+          ? `（最快约 ${Math.max(1, Math.ceil((nearestDisabledUntil - now) / 1000))} 秒后第一个号码恢复可用）`
+          : '';
+        throw new Error(
+          poolEntries.length > 0
+            ? `步骤 6：PayPal 接码池已配置，但当前没有可用号码（池总数 ${poolEntries.length}，当前活跃 ${enabledCount}）${waitSuffix}，不会回退使用 PayPal 电话(不带+1)。请启用号码、等待冷却结束或导入新号码后重试。`
+            : '步骤 6：PayPal 接码池已填写，但未识别到有效号码。请按“手机号 ---- 验证码接口”或“手机号换行验证码接口”的格式导入，不会回退使用 PayPal 电话(不带+1)。'
+        );
       }
       const verificationUrl = String(
         selectedSmsEntry?.verificationUrl
@@ -2927,6 +2970,26 @@ function FindProxyForURL(url, host) {
       return successTab;
     }
 
+    async function shouldAutoCloseHostedCheckoutPayReturn() {
+      if (typeof getState !== 'function') {
+        return false;
+      }
+      const latestState = await getState().catch(() => ({}));
+      return Boolean(latestState?.hostedCheckoutAutoClosePayReturnEnabled);
+    }
+
+    async function closeHostedCheckoutPayReturnTab(tabId, currentUrl = '') {
+      await addLog(`步骤 6：hosted checkout 已离开 PayPal（${currentUrl}），检测到 OpenAI 支付成功回流页，按设置自动关闭支付标签页并继续下一步。`, 'ok');
+      if (chrome?.tabs?.remove && Number.isInteger(Number(tabId))) {
+        await chrome.tabs.remove(tabId).catch(() => {});
+      }
+      await setState({
+        plusCheckoutTabId: null,
+        plusCheckoutUrl: String(currentUrl || '').trim(),
+        plusReturnUrl: String(currentUrl || '').trim(),
+      });
+    }
+
     async function runHostedCheckoutPayPalFlow(tabId, guestProfile, completionPayload = {}) {
       const startedAt = Date.now();
       let hostedVerificationResendAttempts = 0;
@@ -2956,6 +3019,10 @@ function FindProxyForURL(url, host) {
           return;
         }
         if (!isPayPalUrl(currentUrl)) {
+          if (isHostedCheckoutSucceededPayReturnUrl(currentUrl) && await shouldAutoCloseHostedCheckoutPayReturn()) {
+            await closeHostedCheckoutPayReturnTab(tabId, currentUrl);
+            return;
+          }
           await addLog(`步骤 6：hosted checkout 已离开 PayPal（${currentUrl}），继续等待 ChatGPT 支付成功页...`, 'info');
           await waitForHostedCheckoutPaymentsSuccess(tabId);
           return;
@@ -3017,7 +3084,7 @@ function FindProxyForURL(url, host) {
             pageState.hostedBlockedMessage
             || 'PayPal 安全挑战加载失败，当前页面已被风控拦截。'
           ).trim();
-          await addLog(`步骤 6：PayPal hosted checkout 检测到 blocked 页面，停止当前 PayPal 链路并回到 plus-checkout-create 重建 Checkout。原因：${blockedMessage}`, 'warn');
+          await addLog(`步骤 6：PayPal hosted checkout 检测到 blocked 页面，停止当前 PayPal 链路并准备重置支付链路。原因：${blockedMessage}`, 'warn');
           throw new Error(`${HOSTED_CHECKOUT_PAYPAL_BLOCKED_ERROR_PREFIX}${blockedMessage}`);
         }
         if (pageState.hostedStage === 'generic_error' || pageState.hostedGenericError) {
@@ -3298,25 +3365,14 @@ function FindProxyForURL(url, host) {
             const latestState = typeof getState === 'function'
               ? await getState().catch(() => ({}))
               : {};
-            const shouldRetryStep7Only = isSmsOauthCheckoutState(latestState);
-            const shouldRetryNonFreeTrial = Boolean(latestState?.autoRunRetryNonFreeTrial);
             const stopReason = normalizeNonFreeTrialLogMessage(message, {
-              willRetry: shouldRetryNonFreeTrial || shouldRetryStep7Only,
+              willRetry: false,
             });
-            const checkoutCreateStep = getCheckoutCreateDisplayStep(latestState);
             await addLog(
-              shouldRetryStep7Only
-                ? `${stopReason} 先手机号注册 OAuth 将保留当前注册流程，直接回到第 ${checkoutCreateStep} 步重新创建 Checkout。`
-                : shouldRetryNonFreeTrial
-                ? `${stopReason} 无试用套餐自动重试已开启，将换新邮箱重走流程。`
-                : stopReason,
+              `${stopReason} 当前轮将直接结束并进入下一号，不再针对无免费试用资格自动重试。`,
               'warn'
             );
-            if (shouldRetryStep7Only && typeof failNodeFromBackground === 'function') {
-              await failNodeFromBackground('plus-checkout-create', `PLUS_CHECKOUT_NON_FREE_TRIAL::${stopReason}`);
-              return;
-            }
-            if (shouldRetryNonFreeTrial && typeof failNodeFromBackground === 'function') {
+            if (typeof failNodeFromBackground === 'function') {
               await failNodeFromBackground('plus-checkout-create', `PLUS_CHECKOUT_NON_FREE_TRIAL::${stopReason}`);
               return;
             }

@@ -245,8 +245,15 @@
 
     function shouldKeepCustomMailProviderPoolEmail(state = {}) {
       return String(state?.mailProvider || '').trim().toLowerCase() === 'custom'
-        && Array.isArray(state?.customMailProviderPool)
-        && state.customMailProviderPool.length > 0;
+        && (
+          (Array.isArray(state?.customMailProviderPool) && state.customMailProviderPool.length > 0)
+          || (Array.isArray(state?.customMailProviderPoolEntries) && state.customMailProviderPoolEntries.some((entry) => (
+            entry
+            && typeof entry === 'object'
+            && entry.enabled !== false
+            && !entry.used
+          )))
+        );
     }
 
     function isPhoneNumberSupplyExhaustedFailure(error) {
@@ -519,6 +526,8 @@
         const resumingCurrentRound = continueCurrentOnFirstAttempt && targetRun === resumeCurrentRun;
         let attemptRun = resumingCurrentRound ? resumeAttemptRun : 1;
         let reuseExistingProgress = resumingCurrentRound;
+        let phoneNoSupplyRetryCount = 0;
+        let skipRoundIntervalOnce = false;
         const currentRoundState = await getState();
         const keepSameEmailUntilAddPhone = autoRunSkipFailures && shouldKeepCustomMailProviderPoolEmail(currentRoundState);
         const maxAttemptsForRound = autoRunSkipFailures || autoRunRetryNonFreeTrial || autoRunRetryPaypalCallback
@@ -526,6 +535,7 @@
           : Math.max(AUTO_RUN_MAX_RETRIES_PER_ROUND + 1, attemptRun);
 
         while (attemptRun <= maxAttemptsForRound) {
+          let reuseProgressAfterLoop = false;
           runtime.set({
             autoRunCurrentRun: targetRun,
             autoRunAttemptRun: attemptRun,
@@ -589,6 +599,10 @@
               signupMethod: prevState.signupMethod,
               mailProvider: prevState.mailProvider,
               emailGenerator: prevState.emailGenerator,
+              customMailProviderPool: prevState.customMailProviderPool,
+              customMailProviderPoolEntries: prevState.customMailProviderPoolEntries,
+              customEmailPool: prevState.customEmailPool,
+              customEmailPoolEntries: prevState.customEmailPoolEntries,
               gmailBaseEmail: prevState.gmailBaseEmail,
               mail2925BaseEmail: prevState.mail2925BaseEmail,
               currentMail2925AccountId: prevState.currentMail2925AccountId,
@@ -691,7 +705,6 @@
             }
 
             const reason = getErrorMessage(err);
-            roundSummary.failureReasons.push(reason);
             const blockedByPhoneSmsRateLimit = typeof isPhoneSmsPlatformRateLimitFailure === 'function'
               && isPhoneSmsPlatformRateLimitFailure(err);
             const blockedByPhoneNoSupply = !blockedByPhoneSmsRateLimit
@@ -729,9 +742,6 @@
             const blockedByStep4Route405 = typeof isStep4Route405RecoveryLimitFailure === 'function'
               && isStep4Route405RecoveryLimitFailure(err);
             const maxPlusNonFreeTrialAttempts = AUTO_RUN_MAX_RETRIES_PER_ROUND + 1;
-            const retryablePlusNonFreeTrial = blockedByPlusNonFreeTrial
-              && autoRunRetryNonFreeTrial
-              && attemptRun < maxPlusNonFreeTrialAttempts;
             const retryableHostedCheckoutGenericError = blockedByHostedCheckoutGenericError
               && autoRunRetryPaypalCallback
               && attemptRun < maxPlusNonFreeTrialAttempts;
@@ -751,73 +761,13 @@
               && autoRunSkipFailures
               && attemptRun < maxAttemptsForRound;
 
+            if (!blockedByPhoneNoSupply) {
+              roundSummary.failureReasons.push(reason);
+            }
+
             await setState({
               autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
             });
-
-            if (retryablePlusNonFreeTrial) {
-              const retryIndex = attemptRun;
-              await addLog(`第 ${targetRun}/${totalRuns} 轮第 ${attemptRun} 次尝试没有 Plus 免费试用资格：${reason}`, 'warn');
-              cancelPendingCommands('当前尝试因无免费试用资格已放弃。');
-              await broadcastStopToContentScripts();
-              await broadcastAutoRunStatus('retrying', {
-                currentRun: targetRun,
-                totalRuns,
-                attemptRun,
-                sessionId,
-              });
-              forceFreshTabsNextRun = true;
-              await addLog(
-                `无试用套餐自动重试：${Math.round(AUTO_RUN_RETRY_DELAY_MS / 1000)} 秒后换新邮箱，开始第 ${targetRun}/${totalRuns} 轮第 ${attemptRun + 1} 次尝试（第 ${retryIndex}/${AUTO_RUN_MAX_RETRIES_PER_ROUND} 次重试）。`,
-                'warn'
-              );
-              try {
-                await sleepWithStop(AUTO_RUN_RETRY_DELAY_MS);
-              } catch (sleepError) {
-                if (isStopError(sleepError)) {
-                  stoppedEarly = true;
-                  await appendRoundRecordIfNeeded('stopped', getErrorMessage(sleepError), sleepError);
-                  await addLog(`第 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
-                  await broadcastAutoRunStatus('stopped', {
-                    currentRun: targetRun,
-                    totalRuns,
-                    attemptRun,
-                    sessionId: 0,
-                  });
-                  break;
-                }
-                throw sleepError;
-              }
-              try {
-                const parkedForRetry = await waitBeforeAutoRunRetry(targetRun, totalRuns, attemptRun + 1, {
-                  autoRunSkipFailures,
-                  autoRunRetryNonFreeTrial,
-                  autoRunRetryPaypalCallback,
-                  roundSummaries,
-                });
-                if (parkedForRetry) {
-                  parkedByTimer = true;
-                  break;
-                }
-              } catch (sleepError) {
-                if (isStopError(sleepError)) {
-                  stoppedEarly = true;
-                  await appendRoundRecordIfNeeded('stopped', getErrorMessage(sleepError), sleepError);
-                  await addLog(`第 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
-                  await broadcastAutoRunStatus('stopped', {
-                    currentRun: targetRun,
-                    totalRuns,
-                    attemptRun,
-                    sessionId: 0,
-                  });
-                  break;
-                }
-                throw sleepError;
-              }
-              attemptRun += 1;
-              reuseExistingProgress = false;
-              continue;
-            }
 
             if (retryableHostedCheckoutGenericError) {
               const retryIndex = attemptRun;
@@ -983,28 +933,43 @@
             }
 
             if (blockedByPhoneNoSupply) {
-              roundSummary.status = 'failed';
-              roundSummary.finalFailureReason = reason;
+              phoneNoSupplyRetryCount += 1;
+              roundSummary.status = 'pending';
+              roundSummary.finalFailureReason = '';
               await setState({
                 autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
               });
-              await appendRoundRecordIfNeeded('failed', reason, err);
-              cancelPendingCommands('当前轮因接码号池暂无可用号码已终止。');
+              cancelPendingCommands('当前尝试接码号池暂无可用号码，将继续重试取号。');
               await broadcastStopToContentScripts();
               await addLog(
-                autoRunSkipFailures
-                  ? `第 ${targetRun}/${totalRuns} 轮接码号池暂无可用号码。该状态属于全局资源耗尽，已忽略“自动重试/跳过失败继续下一轮”并停止自动运行。`
-                  : `第 ${targetRun}/${totalRuns} 轮接码号池暂无可用号码，当前自动运行将停止。`,
+                `第 ${targetRun}/${totalRuns} 轮接码号池暂无可用号码，将持续重试取号（第 ${phoneNoSupplyRetryCount} 次；${Math.round(AUTO_RUN_RETRY_DELAY_MS / 1000)} 秒后重试）。原因：${reason}`,
                 'warn'
               );
-              stoppedEarly = true;
-              await broadcastAutoRunStatus('stopped', {
+              await broadcastAutoRunStatus('retrying', {
                 currentRun: targetRun,
                 totalRuns,
                 attemptRun,
-                sessionId: 0,
+                sessionId,
               });
-              break;
+              try {
+                await sleepWithStop(AUTO_RUN_RETRY_DELAY_MS);
+              } catch (sleepError) {
+                if (isStopError(sleepError)) {
+                  stoppedEarly = true;
+                  await appendRoundRecordIfNeeded('stopped', getErrorMessage(sleepError), sleepError);
+                  await addLog(`第 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
+                  await broadcastAutoRunStatus('stopped', {
+                    currentRun: targetRun,
+                    totalRuns,
+                    attemptRun,
+                    sessionId: 0,
+                  });
+                  break;
+                }
+                throw sleepError;
+              }
+              reuseProgressAfterLoop = true;
+              continue;
             }
 
             if (blockedByPlusNonFreeTrial) {
@@ -1014,33 +979,17 @@
                 autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
               });
               await appendRoundRecordIfNeeded('failed', reason, err);
-              cancelPendingCommands('当前轮因 Plus 免费试用资格不可用已终止。');
+              cancelPendingCommands('当前轮因 Plus 免费试用资格不可用，已放弃并准备下一轮。');
               await broadcastStopToContentScripts();
-              if (!autoRunSkipFailures) {
-                await addLog(
-                  autoRunRetryNonFreeTrial
-                    ? `第 ${targetRun}/${totalRuns} 轮检测到 Plus 今日应付金额非 0，已达到无试用套餐自动重试上限，当前自动运行将停止。`
-                    : `第 ${targetRun}/${totalRuns} 轮检测到 Plus 今日应付金额非 0，自动重试未开启，当前自动运行将停止。`,
-                  'warn'
-                );
-                stoppedEarly = true;
-                await broadcastAutoRunStatus('stopped', {
-                  currentRun: targetRun,
-                  totalRuns,
-                  attemptRun,
-                  sessionId: 0,
-                });
-                break;
-              }
-
-              await addLog(`第 ${targetRun}/${totalRuns} 轮没有 Plus 免费试用资格，本轮将直接失败并跳过剩余重试。`, 'warn');
+              await addLog(`第 ${targetRun}/${totalRuns} 轮没有 Plus 免费试用资格，本轮将直接失败，不再自动重试该错误。`, 'warn');
               await addLog(
                 targetRun < totalRuns
-                  ? `第 ${targetRun}/${totalRuns} 轮因 Plus 今日应付金额非 0 提前结束，自动流程将继续下一轮。`
+                  ? `第 ${targetRun}/${totalRuns} 轮因 Plus 今日应付金额非 0 提前结束，自动流程将直接进入下一轮。`
                   : `第 ${targetRun}/${totalRuns} 轮因 Plus 今日应付金额非 0 提前结束，已无后续轮次，本次自动运行结束。`,
                 'warn'
               );
               forceFreshTabsNextRun = true;
+              skipRoundIntervalOnce = true;
               break;
             }
 
@@ -1398,13 +1347,18 @@
             forceFreshTabsNextRun = true;
             break;
           } finally {
-            reuseExistingProgress = false;
+            reuseExistingProgress = reuseProgressAfterLoop;
             continueCurrentOnFirstAttempt = false;
           }
         }
 
         if (stoppedEarly || parkedByTimer) {
           break;
+        }
+
+        if (skipRoundIntervalOnce) {
+          skipRoundIntervalOnce = false;
+          continue;
         }
 
         try {

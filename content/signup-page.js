@@ -1382,6 +1382,10 @@ function normalizePhoneDigits(value) {
   return digits;
 }
 
+function isExplicitInternationalPhoneNumber(value) {
+  return /^\s*(?:\+|00)\s*\d/.test(String(value || '').trim());
+}
+
 function extractDialCodeFromText(value) {
   const phoneCountryUtils = (typeof self !== 'undefined' ? self : globalThis)?.MultiPagePhoneCountryUtils
     || globalThis?.MultiPagePhoneCountryUtils
@@ -1436,6 +1440,22 @@ function getSignupCountryLabelAliases(value) {
 
   const normalized = normalizeSignupCountryLabel(raw);
   const compact = normalized.replace(/\s+/g, '');
+  if (
+    /(?:^|\s)(?:us|usa|u\.s\.a?\.?)(?:\s|$)/i.test(raw)
+    || /united\s+states|america|美国|美國/.test(raw)
+    || ['us', 'usa', 'unitedstates', 'america'].includes(compact)
+  ) {
+    [
+      'US',
+      'USA',
+      'United States',
+      'United States of America',
+      'America',
+      '美国',
+      '美國',
+    ].forEach(addAlias);
+  }
+
   if (
     /(?:^|\s)(?:gb|uk)(?:\s|$)/i.test(raw)
     || /england|united\s*kingdom|great\s*britain|\bbritain\b/i.test(raw)
@@ -1729,13 +1749,25 @@ function resolveSignupPhoneDialCodeFromNumber(phoneNumber = '', texts = []) {
   return knownDialCodes.find((code) => digits.startsWith(code) && digits.length > code.length) || '';
 }
 
+function resolveExplicitSignupPhoneDialCode(phoneNumber = '', texts = []) {
+  return isExplicitInternationalPhoneNumber(phoneNumber)
+    ? resolveSignupPhoneDialCodeFromNumber(phoneNumber, texts)
+    : '';
+}
+
 function resolveSignupPhoneTargetDialCode(options = {}, targetOption = null) {
+  const explicitDialCode = resolveExplicitSignupPhoneDialCode(options.phoneNumber);
+  if (explicitDialCode) {
+    return explicitDialCode;
+  }
+
   const optionDialCode = extractDialCodeFromText(getSignupPhoneOptionLabel(targetOption));
   if (optionDialCode) {
     return optionDialCode;
   }
 
   const countryText = String(options.countryLabel || '').trim();
+  if (/^(?:us|usa|u\.s\.a?\.?)$/i.test(countryText) || /united\s+states|america|美国|美國/i.test(countryText)) return '1';
   if (/australia|澳大利亚/i.test(countryText)) return '61';
   if (/thailand|泰国/i.test(countryText)) return '66';
   if (/vietnam|越南/i.test(countryText)) return '84';
@@ -1915,15 +1947,32 @@ function getVisibleSignupPhoneCountryListboxOptions() {
 
 function findSignupPhoneCountryListboxOption(targetOption, options = {}) {
   const candidates = getVisibleSignupPhoneCountryListboxOptions();
+  const phoneCountryUtils = (typeof self !== 'undefined' ? self : globalThis)?.MultiPagePhoneCountryUtils
+    || globalThis?.MultiPagePhoneCountryUtils
+    || {};
+  const explicitPhoneNumber = isExplicitInternationalPhoneNumber(options.phoneNumber);
+  const targetDialCode = resolveSignupPhoneTargetDialCode(options, targetOption);
+  if (typeof phoneCountryUtils.findElementByDialCode === 'function') {
+    const byPhoneNumber = phoneCountryUtils.findElementByDialCode(candidates, options.phoneNumber, {
+      getText: getActionText,
+    });
+    if (byPhoneNumber && explicitPhoneNumber) {
+      return byPhoneNumber;
+    }
+  }
+
+  if (explicitPhoneNumber) {
+    return targetDialCode
+      ? candidates.find((option) => extractDialCodeFromText(getActionText(option)) === targetDialCode) || null
+      : null;
+  }
+
   const byLabel = candidates.find((option) => doesSignupPhoneCountryTextMatchTarget(getActionText(option), targetOption, options));
   if (byLabel) {
     return byLabel;
   }
 
-  const phoneCountryUtils = (typeof self !== 'undefined' ? self : globalThis)?.MultiPagePhoneCountryUtils
-    || globalThis?.MultiPagePhoneCountryUtils
-    || {};
-  if (typeof phoneCountryUtils.findElementByDialCode === 'function') {
+  if (!explicitPhoneNumber && typeof phoneCountryUtils.findElementByDialCode === 'function') {
     const byPhoneNumber = phoneCountryUtils.findElementByDialCode(candidates, options.phoneNumber, {
       getText: getActionText,
     });
@@ -1932,7 +1981,6 @@ function findSignupPhoneCountryListboxOption(targetOption, options = {}) {
     }
   }
 
-  const targetDialCode = resolveSignupPhoneTargetDialCode(options, targetOption);
   if (!targetDialCode) {
     const digits = normalizePhoneDigits(options.phoneNumber);
     let bestMatch = null;
@@ -2088,7 +2136,15 @@ async function ensureSignupPhoneCountrySelected(phoneInput, options = {}) {
 
   const byLabel = findSignupPhoneCountryOptionByLabel(phoneInput, options.countryLabel);
   const byPhoneNumber = findSignupPhoneCountryOptionByPhoneNumber(phoneInput, options.phoneNumber);
-  const targets = [byLabel, byPhoneNumber, null].filter((target, index, list) => (
+  const explicitDialCode = resolveExplicitSignupPhoneDialCode(options.phoneNumber);
+  const matchingLabelOption = explicitDialCode && byLabel
+    && extractDialCodeFromText(getSignupPhoneOptionLabel(byLabel)) === explicitDialCode
+    ? byLabel
+    : null;
+  const orderedTargets = explicitDialCode
+    ? [byPhoneNumber, matchingLabelOption, null]
+    : [byLabel, byPhoneNumber, null];
+  const targets = orderedTargets.filter((target, index, list) => (
     index === list.findIndex((item) => (
       (!item && !target)
       || (item && target && isSameSignupCountryOption(item, target))
@@ -2126,7 +2182,7 @@ async function ensureSignupPhoneCountrySelected(phoneInput, options = {}) {
 function toNationalPhoneNumber(value, dialCode) {
   const digits = normalizePhoneDigits(value);
   const normalizedDialCode = normalizePhoneDigits(dialCode);
-  const isExplicitInternational = /^\s*(?:\+|00)\s*\d/.test(String(value || '').trim());
+  const isExplicitInternational = isExplicitInternationalPhoneNumber(value);
   if (!digits) {
     return '';
   }
@@ -2142,7 +2198,7 @@ function toNationalPhoneNumber(value, dialCode) {
 function toE164PhoneNumber(value, dialCode) {
   const digits = normalizePhoneDigits(value);
   const normalizedDialCode = normalizePhoneDigits(dialCode);
-  const isExplicitInternational = /^\s*(?:\+|00)\s*\d/.test(String(value || '').trim());
+  const isExplicitInternational = isExplicitInternationalPhoneNumber(value);
   if (!digits) {
     return '';
   }
@@ -2434,6 +2490,11 @@ async function fillLoginPhoneInputAndConfirm(phoneInput, options = {}) {
 
 function resolveSignupPhoneDialCode(phoneInput, options = {}) {
   const { phoneNumber = '', countryLabel = '' } = options;
+  const explicitDialCode = resolveExplicitSignupPhoneDialCode(phoneNumber);
+  if (explicitDialCode) {
+    return explicitDialCode;
+  }
+
   const displayedDialCode = getSignupPhoneDisplayedDialCode(phoneInput);
   if (displayedDialCode) {
     return displayedDialCode;
@@ -2796,7 +2857,8 @@ const SIGNUP_USER_ALREADY_EXISTS_ERROR_PREFIX = 'SIGNUP_USER_ALREADY_EXISTS::';
 const SIGNUP_PHONE_PASSWORD_MISMATCH_ERROR_PREFIX = 'SIGNUP_PHONE_PASSWORD_MISMATCH::';
 const AUTH_MAX_CHECK_ATTEMPTS_ERROR_PREFIX = 'AUTH_MAX_CHECK_ATTEMPTS::';
 const STEP8_EMAIL_IN_USE_ERROR_PREFIX = 'STEP8_EMAIL_IN_USE::';
-const SIGNUP_EMAIL_EXISTS_PATTERN = /与此电子邮件地址相关联的帐户已存在|account\s+associated\s+with\s+this\s+email\s+address\s+already\s+exists|email\s+address.*already\s+exists/i;
+const EMAIL_ALREADY_IN_USE_PATTERN = /email_(?:already_)?in_use|该邮箱地址已有关联账户|此邮箱地址已有关联账户|该电子邮件地址已有关联账户|与此电子邮件地址相关联的帐户已存在|account\s+associated\s+with\s+this\s+email\s+address\s+already\s+exists|email\s+address.*already\s+exists/i;
+const SIGNUP_EMAIL_EXISTS_PATTERN = EMAIL_ALREADY_IN_USE_PATTERN;
 const SIGNUP_PHONE_PASSWORD_MISMATCH_PATTERN = /incorrect\s+phone\s+number\s+or\s+password|phone\s+number\s+or\s+password|与此(?:电话|手机)号码相关联的帐户已存在|account\s+associated\s+with\s+this\s+phone\s+number\s+already\s+exists/i;
 
 const authPageRecovery = self.MultiPageAuthPageRecovery?.createAuthPageRecovery?.({
@@ -3634,7 +3696,7 @@ function getAuthTimeoutErrorPageState(options = {}) {
   const routeErrorMatched = AUTH_ROUTE_ERROR_PATTERN.test(text);
   const fetchFailedMatched = /failed\s+to\s+fetch|network\s+error|fetch\s+failed/i.test(text);
   const maxCheckAttemptsBlocked = /max_check_attempts/i.test(text);
-  const emailInUseBlocked = /email_in_use/i.test(text);
+  const emailInUseBlocked = EMAIL_ALREADY_IN_USE_PATTERN.test(text);
   const userAlreadyExistsBlocked = /user_already_exists/i.test(text);
 
   if (!titleMatched && !detailMatched && !routeErrorMatched && !fetchFailedMatched && !maxCheckAttemptsBlocked && !emailInUseBlocked && !userAlreadyExistsBlocked) {

@@ -171,6 +171,47 @@
       return String(match?.[1] || match?.[2] || match?.[3] || '').trim();
     }
 
+    function resolvePhoneDialCodeFromNumber(phoneNumber = '', texts = []) {
+      if (typeof phoneCountryUtils.resolveDialCodeFromPhoneNumber === 'function') {
+        return phoneCountryUtils.resolveDialCodeFromPhoneNumber(phoneNumber, texts);
+      }
+      const digits = normalizePhoneDigits(phoneNumber);
+      if (!digits) {
+        return '';
+      }
+
+      const textDialCodes = texts
+        .map((text) => normalizePhoneDigits(extractDialCodeFromText(text)))
+        .filter((dialCode) => dialCode && digits.startsWith(dialCode) && digits.length > dialCode.length)
+        .sort((left, right) => right.length - left.length);
+      if (textDialCodes[0]) {
+        return textDialCodes[0];
+      }
+
+      const knownDialCodes = [
+        '1246', '1264', '1268', '1284', '1340', '1345', '1441', '1473', '1649', '1664', '1670', '1671', '1684',
+        '1721', '1758', '1767', '1784', '1809', '1829', '1849', '1868', '1869', '1876',
+        '971', '962', '886', '880', '856', '855', '852', '853', '673', '672', '670', '599', '598', '597', '596',
+        '595', '594', '593', '592', '591', '590', '509', '508', '507', '506', '505', '504', '503', '502', '501',
+        '423', '421', '420', '389', '387', '386', '385', '383', '382', '381', '380', '379', '378', '377', '376',
+        '375', '374', '373', '372', '371', '370', '359', '358', '357', '356', '355', '354', '353', '352', '351',
+        '350', '299', '298', '297', '291', '290', '269', '268', '267', '266', '265', '264', '263', '262', '261',
+        '260', '258', '257', '256', '255', '254', '253', '252', '251', '250', '249', '248', '247', '246', '245',
+        '244', '243', '242', '241', '240', '239', '238', '237', '236', '235', '234', '233', '232', '231', '230',
+        '229', '228', '227', '226', '225', '224', '223', '222', '221', '220', '218', '216', '213', '212', '211',
+        '98', '95', '94', '93', '92', '91', '90', '89', '88', '86', '84', '82', '81', '66', '65', '64', '63',
+        '62', '61', '60', '58', '57', '56', '55', '54', '53', '52', '51', '49', '48', '47', '46', '45', '44',
+        '43', '41', '40', '39', '36', '34', '33', '32', '31', '30', '27', '20', '7', '1',
+      ];
+      return knownDialCodes.find((code) => digits.startsWith(code) && digits.length > code.length) || '';
+    }
+
+    function resolveExplicitPhoneDialCode(phoneNumber = '', texts = []) {
+      return isExplicitInternationalPhoneInput(phoneNumber)
+        ? resolvePhoneDialCodeFromNumber(phoneNumber, texts)
+        : '';
+    }
+
     function getCountryButtonText() {
       const form = getAddPhoneForm();
       if (!form) return '';
@@ -363,16 +404,22 @@
       }
 
       const byLabel = findCountryOptionByLabel(countryLabel);
-      if (await trySelectCountryOption(select, byLabel)) {
-        return true;
-      }
-
       const byPhoneNumber = findCountryOptionByPhoneNumber(phoneNumber);
-      if (await trySelectCountryOption(select, byPhoneNumber)) {
-        return true;
+      const explicitDialCode = resolveExplicitPhoneDialCode(phoneNumber);
+      const matchingLabelOption = explicitDialCode && byLabel
+        && extractDialCodeFromText(getOptionLabel(byLabel)) === explicitDialCode
+        ? byLabel
+        : null;
+      const targets = explicitDialCode
+        ? [byPhoneNumber, matchingLabelOption]
+        : [byLabel, byPhoneNumber];
+      for (const targetOption of targets) {
+        if (await trySelectCountryOption(select, targetOption)) {
+          return true;
+        }
       }
 
-      return Boolean(getSelectedCountryOption());
+      return !explicitDialCode && Boolean(getSelectedCountryOption());
     }
 
     function getAddPhoneSubmitButton() {
@@ -756,7 +803,7 @@
         throw new Error(`Failed to select "${countryLabel || 'target country'}" on the add-phone page.`);
       }
 
-      const dialCode = getDisplayedDialCode();
+      const dialCode = resolveExplicitPhoneDialCode(payload.phoneNumber) || getDisplayedDialCode();
       if (!dialCode && !isExplicitInternational) {
         throw new Error(`Could not determine the dial code for "${countryLabel}" on the add-phone page.`);
       }

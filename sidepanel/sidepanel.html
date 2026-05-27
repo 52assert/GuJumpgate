@@ -335,6 +335,21 @@
           <span class="setting-caption">检测到支付成功页后，等待多少秒再进入 OAuth；0 = 立即继续</span>
         </div>
       </div>
+      <div class="data-row" id="row-hosted-checkout-auto-close-pay-return" style="display:none;">
+        <span class="data-label">成功回流</span>
+        <div class="data-inline">
+          <label class="hosted-checkout-setting-toggle"
+            title="PayPal 返回 pay.openai.com/c/pay 且 redirect_status=succeeded 后，自动关闭支付标签页并继续下一步">
+            <span class="setting-caption">回到 OpenAI 支付页后自动关闭支付标签</span>
+            <span class="toggle-switch">
+              <input type="checkbox" id="input-hosted-checkout-auto-close-pay-return-enabled" />
+              <span class="toggle-switch-track" aria-hidden="true">
+                <span class="toggle-switch-thumb"></span>
+              </span>
+            </span>
+          </label>
+        </div>
+      </div>
       <div class="data-row" id="row-plus-checkout-conversion-proxy" style="display:none;">
         <span class="data-label">支付转换代理</span>
         <input type="text" id="input-plus-checkout-conversion-proxy" class="data-input mono"
@@ -599,6 +614,7 @@
             <option value="hotmail-api">Outlook/Hotmail 账号池</option>
             <option value="cloudflare-temp-email">Cloudflare Temp Email</option>
             <option value="cloudmail">Cloud Mail</option>
+            <option value="custom">自定义邮箱（手动验证码）</option>
           </select>
           <button id="btn-mail-login" class="btn btn-outline btn-sm data-inline-btn" type="button" disabled>登录</button>
         </div>
@@ -1516,6 +1532,8 @@
                 <option value="grizzlysms">GrizzlySMS</option>
                 <option value="smspool">SMSPool</option>
                 <option value="chatgpt-api">ChatGPT API 接码</option>
+                <option value="zhusms">ZhuSMS</option>
+                <option value="manual">手动输入</option>
               </select>
             </div>
             <div class="data-row" id="row-phone-sms-provider-order" style="display:none;">
@@ -1530,11 +1548,12 @@
                   <option value="grizzlysms" selected>GrizzlySMS</option>
                   <option value="smspool" selected>SMSPool</option>
                   <option value="chatgpt-api" selected>ChatGPT API 接码</option>
+                  <option value="zhusms" selected>ZhuSMS</option>
                 </select>
                 <div class="hero-sms-country-mainline">
                   <div id="phone-sms-provider-order-menu-shell" class="hero-sms-country-menu">
                     <button id="btn-phone-sms-provider-order-menu" class="btn btn-outline btn-sm hero-sms-country-menu-btn" type="button" aria-haspopup="listbox" aria-expanded="false">
-                      HeroSMS / 5sim / NexSMS / SMSBower / SMS Verification Number / GrizzlySMS / SMSPool / ChatGPT API 接码 (8/8)
+                      HeroSMS / 5sim / NexSMS / SMSBower / SMS Verification Number / GrizzlySMS / SMSPool / ChatGPT API 接码 / ZhuSMS (9/9)
                     </button>
                     <div id="phone-sms-provider-order-menu" class="hero-sms-country-menu-dropdown" role="listbox" aria-multiselectable="true" hidden></div>
                   </div>
@@ -1586,7 +1605,7 @@
               </select>
             </div>
             <div class="data-row" id="row-hero-sms-api-key" style="display:none;">
-              <span class="data-label">接码 API</span>
+              <span class="data-label" id="label-hero-sms-api-key">接码 API</span>
               <div class="input-with-icon">
                 <input type="password" id="input-hero-sms-api-key" class="data-input data-input-with-icon mono"
                   placeholder="请输入 HeroSMS API Key" />
@@ -2014,7 +2033,9 @@
   <script src="../phone-sms/providers/smsbower.js"></script>
   <script src="../phone-sms/providers/sms-verification-number.js"></script>
   <script src="../phone-sms/providers/grizzlysms.js"></script>
+  <script src="../phone-sms/providers/smspool.js"></script>
   <script src="../phone-sms/providers/chatgpt-api.js"></script>
+  <script src="../phone-sms/providers/zhusms.js"></script>
   <script src="../phone-sms/providers/registry.js"></script>
   <script src="../icloud-utils.js"></script>
   <script src="../mail-provider-utils.js"></script>

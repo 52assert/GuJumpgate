@@ -60,6 +60,22 @@
     const normalized = normalizeCountryLabel(raw);
     const compact = normalized.replace(/\s+/g, '');
     if (
+      /(?:^|\s)(?:us|usa|u\.s\.a?\.?)(?:\s|$)/i.test(raw)
+      || /united\s+states|america|美国|美國/.test(raw)
+      || ['us', 'usa', 'unitedstates', 'america'].includes(compact)
+    ) {
+      [
+        'US',
+        'USA',
+        'United States',
+        'United States of America',
+        'America',
+        '美国',
+        '美國',
+      ].forEach(addAlias);
+    }
+
+    if (
       /(?:^|\s)(?:gb|uk)(?:\s|$)/i.test(raw)
       || /england|united\s*kingdom|great\s*britain|\bbritain\b/i.test(raw)
       || /英国|英格兰|大不列颠/.test(raw)

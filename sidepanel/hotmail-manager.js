@@ -279,7 +279,7 @@
             <button class="btn btn-outline btn-sm" type="button" data-account-action="select" data-account-id="${helpers.escapeHtml(account.id)}">使用此账号</button>
             <button class="btn btn-outline btn-sm" type="button" data-account-action="toggle-used" data-account-id="${helpers.escapeHtml(account.id)}">${account.used ? '标记未用' : '标记已用'}</button>
             <button class="btn btn-primary btn-sm" type="button" data-account-action="verify" data-account-id="${helpers.escapeHtml(account.id)}">校验</button>
-            <button class="btn btn-outline btn-sm" type="button" data-account-action="test" data-account-id="${helpers.escapeHtml(account.id)}">复制最新验证码</button>
+            <button class="btn btn-outline btn-sm" type="button" data-account-action="test" data-account-id="${helpers.escapeHtml(account.id)}">复制验证码</button>
             <button class="btn btn-ghost btn-sm" type="button" data-account-action="delete" data-account-id="${helpers.escapeHtml(account.id)}">删除</button>
           </div>
         </div>
@@ -488,22 +488,31 @@
           applyHotmailAccountMutation(response.account, { preserveCurrentSelection: true });
           helpers.showToast(`账号 ${response.account.email} 校验通过`, 'success', 2200);
         } else if (action === 'test') {
-          const response = await runtime.sendMessage({
-            type: 'TEST_HOTMAIL_ACCOUNT',
-            source: 'sidepanel',
-            payload: { accountId },
-          });
-          if (response?.error) throw new Error(response.error);
-          applyHotmailAccountMutation(response.account, { preserveCurrentSelection: true });
-          if (response.latestCode) {
-            await helpers.copyTextToClipboard(response.latestCode);
-            const mailbox = response.latestMailbox ? `（${response.latestMailbox}）` : '';
-            helpers.showToast(`已复制最新验证码 ${response.latestCode}${mailbox}`, 'success', 2600);
-          } else if (response.latestSubject) {
-            const mailbox = response.latestMailbox ? `（${response.latestMailbox}）` : '';
-            helpers.showToast(`最新邮件${mailbox}没有验证码：${response.latestSubject}`, 'warn', 3200);
-          } else {
-            helpers.showToast('当前没有可读取的最新邮件。', 'warn', 2600);
+          const previousLabel = actionButton.textContent;
+          actionButton.textContent = '取码中...';
+          try {
+            const response = await runtime.sendMessage({
+              type: 'TEST_HOTMAIL_ACCOUNT',
+              source: 'sidepanel',
+              payload: { accountId },
+            });
+            if (response?.error) throw new Error(response.error);
+            applyHotmailAccountMutation(response.account, { preserveCurrentSelection: true });
+            if (response.latestCode) {
+              await helpers.copyTextToClipboard(response.latestCode);
+              const mailbox = response.matchedMailbox || response.latestMailbox
+                ? `（${response.matchedMailbox || response.latestMailbox}）`
+                : '';
+              const fallbackHint = response.usedManualFallback ? '（宽松匹配）' : '';
+              helpers.showToast(`已复制验证码 ${response.latestCode}${mailbox}${fallbackHint}`, 'success', 2600);
+            } else if (response.latestSubject) {
+              const mailbox = response.latestMailbox ? `（${response.latestMailbox}）` : '';
+              helpers.showToast(`未找到匹配验证码；最新邮件${mailbox}：${response.latestSubject}`, 'warn', 3600);
+            } else {
+              helpers.showToast(response.lastError || '当前没有可读取的验证码邮件。', 'warn', 3000);
+            }
+          } finally {
+            actionButton.textContent = previousLabel;
           }
         } else if (action === 'delete') {
           const confirmed = await helpers.openConfirmModal({

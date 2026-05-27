@@ -71,10 +71,11 @@
         ? routeErrorPattern.test(text)
         : false;
       const maxCheckAttemptsBlocked = /max_check_attempts/i.test(text);
+      const emailInUseBlocked = /email_(?:already_)?in_use|该邮箱地址已有关联账户|此邮箱地址已有关联账户|该电子邮件地址已有关联账户|与此电子邮件地址相关联的帐户已存在|account\s+associated\s+with\s+this\s+email\s+address\s+already\s+exists|email\s+address.*already\s+exists/i.test(text);
       const userAlreadyExistsBlocked = /user_already_exists/i.test(text);
       const fetchFailedMatched = /failed\s+to\s+fetch|network\s+error|fetch\s+failed/i.test(text);
 
-      if (!titleMatched && !detailMatched && !routeErrorMatched && !fetchFailedMatched && !maxCheckAttemptsBlocked && !userAlreadyExistsBlocked) {
+      if (!titleMatched && !detailMatched && !routeErrorMatched && !fetchFailedMatched && !maxCheckAttemptsBlocked && !emailInUseBlocked && !userAlreadyExistsBlocked) {
         return null;
       }
 
@@ -88,6 +89,7 @@
         routeErrorMatched,
         fetchFailedMatched,
         maxCheckAttemptsBlocked,
+        emailInUseBlocked,
         userAlreadyExistsBlocked,
       };
     }

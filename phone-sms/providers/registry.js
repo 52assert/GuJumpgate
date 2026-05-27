@@ -10,6 +10,8 @@
   const PROVIDER_GRIZZLYSMS = 'grizzlysms';
   const PROVIDER_SMSPOOL = 'smspool';
   const PROVIDER_CHATGPT_API = 'chatgpt-api';
+  const PROVIDER_ZHUSMS = 'zhusms';
+  const PROVIDER_MANUAL = 'manual';
   const DEFAULT_PROVIDER = PROVIDER_HERO_SMS;
   const DEFAULT_PROVIDER_ORDER = Object.freeze([
     PROVIDER_HERO_SMS,
@@ -20,6 +22,7 @@
     PROVIDER_GRIZZLYSMS,
     PROVIDER_SMSPOOL,
     PROVIDER_CHATGPT_API,
+    PROVIDER_ZHUSMS,
   ]);
   const PROVIDER_DEFINITIONS = Object.freeze({
     [PROVIDER_HERO_SMS]: Object.freeze({
@@ -62,6 +65,16 @@
       label: 'ChatGPT API 接码',
       moduleKey: 'PhoneSmsChatGptApiProvider',
     }),
+    [PROVIDER_ZHUSMS]: Object.freeze({
+      id: PROVIDER_ZHUSMS,
+      label: 'ZhuSMS',
+      moduleKey: 'PhoneSmsZhuSmsProvider',
+    }),
+    [PROVIDER_MANUAL]: Object.freeze({
+      id: PROVIDER_MANUAL,
+      label: '手动输入',
+      moduleKey: null,
+    }),
   });
 
   function resolveProviderKey(value = '') {
@@ -99,6 +112,9 @@
 
     const pushProvider = (entry) => {
       const provider = normalizeProviderId(entry, DEFAULT_PROVIDER);
+      if (provider === PROVIDER_MANUAL) {
+        return;
+      }
       if (!provider || seen.has(provider)) {
         return;
       }
@@ -165,6 +181,8 @@
     PROVIDER_GRIZZLYSMS,
     PROVIDER_SMSPOOL,
     PROVIDER_CHATGPT_API,
+    PROVIDER_ZHUSMS,
+    PROVIDER_MANUAL,
     DEFAULT_PROVIDER,
     DEFAULT_PROVIDER_ORDER,
     PROVIDER_DEFINITIONS,

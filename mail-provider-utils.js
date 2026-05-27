@@ -22,12 +22,15 @@
     { value: GMAIL_PROVIDER, label: 'Gmail 邮箱' },
   ];
 
-  function normalizeMailProvider(value = '') {
-    const normalized = String(value || '').trim().toLowerCase();
-    switch (normalized) {
-      case HOTMAIL_PROVIDER:
-      case '163':
-      case '163-vip':
+	  function normalizeMailProvider(value = '') {
+	    const normalized = String(value || '').trim().toLowerCase();
+	    switch (normalized) {
+	      case 'custom':
+	      case 'manual':
+	        return 'custom';
+	      case HOTMAIL_PROVIDER:
+	      case '163':
+	      case '163-vip':
       case '126':
       case 'qq':
       case 'inbucket':
@@ -69,13 +72,16 @@
     return getMailProviderConfig({ mailProvider: normalizedProvider });
   }
 
-  function getMailProviderConfig(state = {}, options = {}) {
-    const provider = normalizeMailProvider(state.mailProvider);
-    const normalizeInbucketOrigin = options.normalizeInbucketOrigin || (() => '');
+	  function getMailProviderConfig(state = {}, options = {}) {
+	    const provider = normalizeMailProvider(state.mailProvider);
+	    const normalizeInbucketOrigin = options.normalizeInbucketOrigin || (() => '');
 
-    if (provider === HOTMAIL_PROVIDER) {
-      return { provider: HOTMAIL_PROVIDER, label: 'Hotmail（微软 Graph）' };
-    }
+	    if (provider === 'custom') {
+	      return { provider: 'custom', label: '自定义邮箱（手动验证码）', manual: true };
+	    }
+	    if (provider === HOTMAIL_PROVIDER) {
+	      return { provider: HOTMAIL_PROVIDER, label: 'Hotmail（微软 Graph）' };
+	    }
     if (provider === '163') {
       return {
         source: 'mail-163',

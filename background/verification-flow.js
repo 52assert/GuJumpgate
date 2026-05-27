@@ -260,11 +260,20 @@
           const authState = String(result?.state || '').trim();
           const authUrl = String(result?.url || '').trim();
           const verificationErrorText = String(result?.verificationErrorText || '').trim();
+          const emailInUseBlocked = Boolean(result?.emailInUseBlocked);
           lastSnapshot = {
             state: authState || 'unknown',
             url: authUrl,
           };
 
+          if (emailInUseBlocked) {
+            return {
+              success: false,
+              reason: 'email_in_use',
+              emailInUse: true,
+              url: authUrl,
+            };
+          }
           if (authState === 'verification_page' && verificationErrorText) {
             return {
               success: false,
@@ -1163,9 +1172,12 @@
           if (step === 8 && isRetryableVerificationTransportError(err)) {
             const fallback = await detectStep8PostSubmitFallback({
               step,
-              timeoutMs: 9000,
+              timeoutMs: 20000,
               pollIntervalMs: 300,
             });
+            if (fallback.emailInUse) {
+              throw new Error(`STEP8_EMAIL_IN_USE::步骤 ${completionStep}：绑定邮箱验证码提交后检测到 email_already_in_use，当前邮箱已有关联账户，需要更换邮箱。`);
+            }
             if (fallback.success) {
               if (fallback.addPhonePage) {
                 await addLog('验证码提交后通信中断，但页面已进入手机号验证页，按提交成功继续。', 'warn', {
@@ -1206,7 +1218,7 @@
             });
             const fallback = await detectStep8PostSubmitFallback({
               step,
-              timeoutMs: 9000,
+              timeoutMs: 20000,
               pollIntervalMs: 300,
             });
             if (fallback.invalidCode) {
@@ -1215,6 +1227,9 @@
                 errorText: fallback.errorText || '验证码被拒绝。',
                 url: fallback.url || '',
               };
+            }
+            if (fallback.emailInUse) {
+              throw new Error(`STEP8_EMAIL_IN_USE::步骤 ${completionStep}：绑定邮箱验证码提交后检测到 email_already_in_use，当前邮箱已有关联账户，需要更换邮箱。`);
             }
             if (fallback.success) {
               if (fallback.addPhonePage) {

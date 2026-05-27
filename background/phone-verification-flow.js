@@ -15,6 +15,8 @@
       sendToContentScript,
       sendToContentScriptResilient,
       navigateAuthTabToAddPhone = null,
+      requestManualPhoneNumberInput = null,
+      requestManualPhoneCodeInput = null,
       setState,
       broadcastDataUpdate = null,
       sleepWithStop,
@@ -35,6 +37,9 @@
       DEFAULT_GRIZZLY_SMS_SERVICE_CODE = 'dr',
       DEFAULT_SMSPOOL_BASE_URL = 'https://api.smspool.net/stubs/handler_api.php?setting=smspool',
       DEFAULT_SMSPOOL_SERVICE_CODE = '671',
+      DEFAULT_ZHUSMS_BASE_URL = 'https://zhusms.com',
+      DEFAULT_ZHUSMS_PROXY_BASE_URL = 'http://127.0.0.1:17373',
+      DEFAULT_ZHUSMS_SERVICE_CODE = 'codex',
       DEFAULT_HERO_SMS_REUSE_ENABLED = true,
       createFiveSimProvider = null,
       createNexSmsProvider = null,
@@ -42,6 +47,7 @@
       createSmsVerificationNumberProvider = null,
       createGrizzlySmsProvider = null,
       createSmsPoolProvider = null,
+      createZhuSmsProvider = null,
       HERO_SMS_COUNTRY_ID = 33,
       HERO_SMS_COUNTRY_LABEL = 'Colombia',
       HERO_SMS_SERVICE_CODE = 'dr',
@@ -101,6 +107,8 @@
     const PHONE_SMS_PROVIDER_GRIZZLYSMS = 'grizzlysms';
     const PHONE_SMS_PROVIDER_SMSPOOL = 'smspool';
     const PHONE_SMS_PROVIDER_CHATGPT_API = 'chatgpt-api';
+    const PHONE_SMS_PROVIDER_ZHUSMS = 'zhusms';
+    const PHONE_SMS_PROVIDER_MANUAL = 'manual';
     const DEFAULT_PHONE_SMS_PROVIDER = PHONE_SMS_PROVIDER_HERO;
     const DEFAULT_PHONE_SMS_PROVIDER_ORDER = Object.freeze([
       PHONE_SMS_PROVIDER_HERO,
@@ -111,6 +119,7 @@
       PHONE_SMS_PROVIDER_GRIZZLYSMS,
       PHONE_SMS_PROVIDER_SMSPOOL,
       PHONE_SMS_PROVIDER_CHATGPT_API,
+      PHONE_SMS_PROVIDER_ZHUSMS,
     ]);
     const MAX_PHONE_REUSABLE_POOL = 12;
     const PHONE_CODE_TIMEOUT_ERROR_PREFIX = 'PHONE_CODE_TIMEOUT::';
@@ -144,6 +153,10 @@
       { prefix: '56', id: 151, label: 'Chile' },
       { prefix: '1', id: 187, label: 'USA' },
     ]);
+    const MANUAL_PHONE_DEFAULT_COUNTRY = Object.freeze({
+      id: 187,
+      label: 'USA',
+    });
     const activationPriceHintsByKey = new Map();
     let activePhoneVerificationLogStep = null;
     let activePhoneVerificationLogStepKey = null;
@@ -209,6 +222,23 @@
       return String(value || '').trim();
     }
 
+    function normalizeManualPhoneNumber(value = '') {
+      const text = String(value || '').trim().replace(/[\s().-]+/g, '');
+      if (!text) {
+        return '';
+      }
+      const hasLeadingPlus = text.startsWith('+');
+      const digits = text.replace(/\D+/g, '');
+      if (!digits) {
+        return '';
+      }
+      return hasLeadingPlus ? `+${digits}` : digits;
+    }
+
+    function normalizeManualPhoneCode(value = '') {
+      return String(value || '').trim().replace(/[^\d]/g, '');
+    }
+
     function normalizePhoneSmsProvider(value = '') {
       const rootScope = typeof self !== 'undefined' ? self : globalThis;
       if (rootScope.PhoneSmsProviderRegistry?.normalizeProviderId) {
@@ -235,6 +265,12 @@
       }
       if (normalized === PHONE_SMS_PROVIDER_CHATGPT_API) {
         return PHONE_SMS_PROVIDER_CHATGPT_API;
+      }
+      if (normalized === PHONE_SMS_PROVIDER_ZHUSMS) {
+        return PHONE_SMS_PROVIDER_ZHUSMS;
+      }
+      if (normalized === PHONE_SMS_PROVIDER_MANUAL) {
+        return PHONE_SMS_PROVIDER_MANUAL;
       }
       return PHONE_SMS_PROVIDER_HERO;
     }
@@ -319,6 +355,25 @@
         .toLowerCase()
         .replace(/[^a-z0-9_-]/g, '');
       return fallbackNormalized || 'dr';
+    }
+
+    function normalizeZhuSmsServiceCode(value = '', fallback = DEFAULT_ZHUSMS_SERVICE_CODE) {
+      const rootScope = typeof self !== 'undefined' ? self : globalThis;
+      if (rootScope.PhoneSmsZhuSmsProvider?.normalizeZhuSmsServiceCode) {
+        return rootScope.PhoneSmsZhuSmsProvider.normalizeZhuSmsServiceCode(value, fallback);
+      }
+      const normalized = String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]/g, '');
+      if (normalized) {
+        return normalized;
+      }
+      const fallbackNormalized = String(fallback || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]/g, '');
+      return fallbackNormalized || DEFAULT_ZHUSMS_SERVICE_CODE;
     }
 
     function normalizeFiveSimCountryCode(value = '', fallback = 'thailand') {
@@ -630,9 +685,25 @@
       return String(value || '').trim() || fallback;
     }
 
-    function inferHeroSmsCountryFromPhoneNumber(phoneNumber = '') {
-      const digits = String(phoneNumber || '').replace(/\D+/g, '');
+    function inferHeroSmsCountryFromPhoneNumber(phoneNumber = '', options = {}) {
+      const text = String(phoneNumber || '').trim();
+      const digits = text.replace(/\D+/g, '');
       if (!digits) {
+        return null;
+      }
+      if (options.allowNanpLocal !== false && digits.length === 10) {
+        return {
+          id: 187,
+          label: 'USA',
+        };
+      }
+      if (options.allowNanpLocal !== false && digits.length === 11 && digits.startsWith('1')) {
+        return {
+          id: 187,
+          label: 'USA',
+        };
+      }
+      if (!/^\s*(?:\+|00)\s*\d/.test(text)) {
         return null;
       }
       const match = HERO_SMS_COUNTRY_BY_PHONE_PREFIX.find((entry) => digits.startsWith(entry.prefix));
@@ -738,6 +809,9 @@
 
       source.forEach((entry) => {
         const provider = normalizePhoneSmsProvider(entry);
+        if (provider === PHONE_SMS_PROVIDER_MANUAL) {
+          return;
+        }
         if (seen.has(provider)) {
           return;
         }
@@ -756,6 +830,9 @@
       const fallbackNormalized = [];
       fallback.forEach((entry) => {
         const provider = normalizePhoneSmsProvider(entry);
+        if (provider === PHONE_SMS_PROVIDER_MANUAL) {
+          return;
+        }
         if (!provider || fallbackNormalized.includes(provider)) {
           return;
         }
@@ -768,6 +845,9 @@
       const currentProvider = normalizePhoneSmsProvider(
         preferredProvider || state?.phoneSmsProvider || DEFAULT_PHONE_SMS_PROVIDER
       );
+      if (currentProvider === PHONE_SMS_PROVIDER_MANUAL || currentProvider === PHONE_SMS_PROVIDER_ZHUSMS) {
+        return [currentProvider];
+      }
       const hasExplicitOrder = Array.isArray(state?.phoneSmsProviderOrder)
         ? state.phoneSmsProviderOrder.length > 0
         : String(state?.phoneSmsProviderOrder || '').trim().length > 0;
@@ -1035,6 +1115,12 @@
       if (provider === PHONE_SMS_PROVIDER_CHATGPT_API) {
         return 'ChatGPT API 接码';
       }
+      if (provider === PHONE_SMS_PROVIDER_ZHUSMS) {
+        return 'ZhuSMS';
+      }
+      if (provider === PHONE_SMS_PROVIDER_MANUAL) {
+        return '手动输入';
+      }
       return 'HeroSMS';
     }
 
@@ -1282,6 +1368,7 @@
       return factory({
         addLog,
         fetchImpl,
+        proxyBaseUrl: DEFAULT_ZHUSMS_PROXY_BASE_URL,
         requestTimeoutMs: DEFAULT_PHONE_REQUEST_TIMEOUT_MS,
         sleepWithStop,
         throwIfStopped,
@@ -1389,6 +1476,25 @@
 
     function getChatGptApiProviderForState(_state = {}) {
       return createResolvedChatGptApiProvider();
+    }
+
+    function createResolvedZhuSmsProvider() {
+      const rootScope = typeof self !== 'undefined' ? self : globalThis;
+      const factory = createZhuSmsProvider || rootScope.PhoneSmsZhuSmsProvider?.createProvider;
+      if (typeof factory !== 'function') {
+        return null;
+      }
+      return factory({
+        addLog,
+        fetchImpl,
+        requestTimeoutMs: DEFAULT_PHONE_REQUEST_TIMEOUT_MS,
+        sleepWithStop,
+        throwIfStopped,
+      });
+    }
+
+    function getZhuSmsProviderForState(_state = {}) {
+      return createResolvedZhuSmsProvider();
     }
 
     function normalizeFiveSimCountryId(value, fallback = 'england') {
@@ -1570,7 +1676,9 @@
                         ? DEFAULT_GRIZZLY_SMS_SERVICE_CODE
                         : (provider === PHONE_SMS_PROVIDER_SMSPOOL
                           ? DEFAULT_SMSPOOL_SERVICE_CODE
-                          : (provider === PHONE_SMS_PROVIDER_CHATGPT_API ? 'custom-api' : HERO_SMS_SERVICE_CODE))
+                          : (provider === PHONE_SMS_PROVIDER_CHATGPT_API
+                            ? 'custom-api'
+                            : (provider === PHONE_SMS_PROVIDER_ZHUSMS ? DEFAULT_ZHUSMS_SERVICE_CODE : HERO_SMS_SERVICE_CODE)))
                     )
                 ))
         )
@@ -1582,11 +1690,14 @@
             ? normalizeNexSmsCountryId(rawCountryId, 0)
             : normalizeCountryId(rawCountryId, fallbackCountryId)
         );
+      const manualPhoneNumber = provider === PHONE_SMS_PROVIDER_MANUAL
+        ? normalizeManualPhoneNumber(phoneNumber)
+        : phoneNumber;
       return {
         activationId,
-        phoneNumber,
+        phoneNumber: manualPhoneNumber || phoneNumber,
         provider,
-        serviceCode,
+        serviceCode: provider === PHONE_SMS_PROVIDER_MANUAL ? 'manual' : serviceCode,
         countryId,
         ...(provider === PHONE_SMS_PROVIDER_FIVE_SIM ? { countryCode: countryId } : {}),
         ...(countryLabel ? { countryLabel } : {}),
@@ -1595,6 +1706,7 @@
         ...(expiresAt > 0 ? { expiresAt } : {}),
         ...(statusAction ? { statusAction } : {}),
         ...(record.source ? { source: String(record.source || '').trim() } : {}),
+        ...(provider === PHONE_SMS_PROVIDER_MANUAL ? { manualOnly: true } : {}),
         ...(record.phoneCodeReceived ? { phoneCodeReceived: true } : {}),
         ...(record.phoneCodeReceivedAt ? { phoneCodeReceivedAt: Math.max(0, Number(record.phoneCodeReceivedAt) || 0) } : {}),
       };
@@ -2280,6 +2392,12 @@
 
     function resolvePhoneConfig(state = {}) {
       const provider = normalizePhoneSmsProvider(state?.phoneSmsProvider || DEFAULT_PHONE_SMS_PROVIDER);
+      if (provider === PHONE_SMS_PROVIDER_MANUAL) {
+        return {
+          provider,
+          countryCandidates: [],
+        };
+      }
       if (provider === PHONE_SMS_PROVIDER_5SIM) {
         const apiKey = normalizeApiKey(state.fiveSimApiKey || state.heroSmsApiKey);
         if (!apiKey) {
@@ -2383,6 +2501,21 @@
             heroSmsCountryLabel: state?.smsPoolCountryLabel || state?.heroSmsCountryLabel,
             heroSmsCountryFallback: state?.smsPoolCountryFallback || state?.heroSmsCountryFallback,
           }),
+        };
+      }
+      if (provider === PHONE_SMS_PROVIDER_ZHUSMS) {
+        const sid = normalizeApiKey(state.zhuSmsSid || state.heroSmsApiKey);
+        if (!sid) {
+          throw new Error('ZhuSMS session cookie 缺失，请在 ZhuSMS Cookie 填写 zhusms_sid 或完整 Cookie。');
+        }
+        return {
+          provider,
+          apiKey: sid,
+          sid,
+          baseUrl: normalizeUrl(state.zhuSmsBaseUrl, DEFAULT_ZHUSMS_BASE_URL).replace(/\/+$/, ''),
+          proxyBaseUrl: normalizeUrl(state.zhuSmsProxyBaseUrl, DEFAULT_ZHUSMS_PROXY_BASE_URL).replace(/\/+$/, ''),
+          serviceCode: normalizeZhuSmsServiceCode(state.zhuSmsServiceCode, DEFAULT_ZHUSMS_SERVICE_CODE),
+          countryCandidates: [{ id: 187, label: 'USA' }],
         };
       }
       if (provider === PHONE_SMS_PROVIDER_CHATGPT_API) {
@@ -3885,6 +4018,9 @@
     }
 
     async function requestPhoneActivation(state = {}, options = {}) {
+      if (normalizePhoneSmsProvider(state?.phoneSmsProvider) === PHONE_SMS_PROVIDER_MANUAL) {
+        return requestManualPhoneActivation(state, options);
+      }
       if (normalizePhoneSmsProvider(state?.phoneSmsProvider) === PHONE_SMS_PROVIDER_FIVE_SIM) {
         const provider = getFiveSimProviderForState(state);
         if (provider) {
@@ -3917,6 +4053,12 @@
       }
       if (normalizePhoneSmsProvider(state?.phoneSmsProvider) === PHONE_SMS_PROVIDER_CHATGPT_API) {
         const provider = getChatGptApiProviderForState(state);
+        if (provider) {
+          return provider.requestActivation(state, options);
+        }
+      }
+      if (normalizePhoneSmsProvider(state?.phoneSmsProvider) === PHONE_SMS_PROVIDER_ZHUSMS) {
+        const provider = getZhuSmsProviderForState(state);
         if (provider) {
           return provider.requestActivation(state, options);
         }
@@ -4260,10 +4402,54 @@
       throw new Error(`${heroLikeProviderLabel} 获取手机号失败，最后状态：${finalLastFailureText || '未知'}。`);
     }
 
+    async function requestManualPhoneActivation(state = {}, options = {}) {
+      if (typeof requestManualPhoneNumberInput !== 'function') {
+        throw new Error('手动手机号输入弹窗未加载，请先打开侧边栏。');
+      }
+      const preferredPhoneNumber = normalizeManualPhoneNumber(
+        options?.phoneNumber
+        || state?.currentPhoneActivation?.phoneNumber
+        || state?.signupPhoneNumber
+        || state?.signupPhoneCompletedActivation?.phoneNumber
+        || ''
+      );
+      const response = await requestManualPhoneNumberInput({
+        step: getActivePhoneVerificationVisibleStep(),
+        provider: PHONE_SMS_PROVIDER_MANUAL,
+        phoneNumber: preferredPhoneNumber,
+      });
+      const phoneNumber = normalizeManualPhoneNumber(response?.phoneNumber);
+      if (!phoneNumber) {
+        throw new Error(`步骤 ${getActivePhoneVerificationVisibleStep()}：手动手机号输入已取消。`);
+      }
+      const inferredCountry = inferHeroSmsCountryFromPhoneNumber(phoneNumber);
+      const fallbackCountry = MANUAL_PHONE_DEFAULT_COUNTRY;
+      const activationIdSuffix = normalizePhoneDigits(phoneNumber).slice(-4) || Math.random().toString(36).slice(2, 8);
+      const activation = normalizeActivation({
+        activationId: `manual-${Date.now()}-${activationIdSuffix}`,
+        phoneNumber,
+        provider: PHONE_SMS_PROVIDER_MANUAL,
+        serviceCode: 'manual',
+        countryId: inferredCountry?.id || fallbackCountry.id || HERO_SMS_COUNTRY_ID,
+        countryLabel: inferredCountry?.label || fallbackCountry.label || HERO_SMS_COUNTRY_LABEL,
+        successfulUses: 0,
+        maxUses: 1,
+        source: 'manual-phone',
+        manualOnly: true,
+      });
+      if (!activation) {
+        throw new Error('手动手机号输入无效。');
+      }
+      return activation;
+    }
+
     async function reactivatePhoneActivation(state = {}, activation) {
       const normalizedActivation = normalizeActivation(activation);
       if (!normalizedActivation) {
         throw new Error('缺少可复用的手机号接码订单。');
+      }
+      if (getActivationProviderId(normalizedActivation, state) === PHONE_SMS_PROVIDER_MANUAL) {
+        return normalizedActivation;
       }
       if (getActivationProviderId(normalizedActivation, state) === PHONE_SMS_PROVIDER_FIVE_SIM) {
         const provider = getFiveSimProviderForState(state);
@@ -4378,6 +4564,9 @@
         );
         return;
       }
+      if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_MANUAL) {
+        return;
+      }
       if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_FIVE_SIM) {
         const provider = getFiveSimProviderForState(state);
         if (provider) {
@@ -4420,6 +4609,13 @@
           return;
         }
       }
+      if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_ZHUSMS) {
+        const provider = getZhuSmsProviderForState(state);
+        if (provider) {
+          await provider.finishActivation(state, activation);
+          return;
+        }
+      }
       await setPhoneActivationStatus(state, activation, 6, 'HeroSMS setStatus(6)');
     }
 
@@ -4432,6 +4628,9 @@
             `步骤 9：白嫖复用模式仅请求短信，跳过 ${identifier} 的接码取消状态。`,
             'info'
           );
+          return;
+        }
+        if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_MANUAL) {
           return;
         }
         if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_FIVE_SIM) {
@@ -4471,6 +4670,13 @@
         }
         if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_CHATGPT_API) {
           const provider = getChatGptApiProviderForState(state);
+          if (provider) {
+            await provider.cancelActivation(state, activation);
+            return;
+          }
+        }
+        if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_ZHUSMS) {
+          const provider = getZhuSmsProviderForState(state);
           if (provider) {
             await provider.cancelActivation(state, activation);
             return;
@@ -4538,6 +4744,9 @@
           );
           return;
         }
+        if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_MANUAL) {
+          return;
+        }
         if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_FIVE_SIM) {
           const provider = getFiveSimProviderForState(state);
           if (provider) {
@@ -4580,6 +4789,13 @@
             return;
           }
         }
+        if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_ZHUSMS) {
+          const provider = getZhuSmsProviderForState(state);
+          if (provider) {
+            await provider.banActivation(state, activation);
+            return;
+          }
+        }
         await setPhoneActivationStatus(state, activation, 8, 'HeroSMS setStatus(8)');
       } catch (_) {
         // Best-effort cleanup.
@@ -4587,6 +4803,9 @@
     }
 
     async function requestAdditionalPhoneSms(state = {}, activation) {
+      if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_MANUAL) {
+        return;
+      }
       const config = resolvePhoneConfig(state);
       if (config.provider !== PHONE_SMS_PROVIDER_HERO) {
         if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_SMSBOWER) {
@@ -4609,6 +4828,12 @@
         }
         if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_CHATGPT_API) {
           const provider = getChatGptApiProviderForState(state);
+          if (provider?.requestAdditionalSms) {
+            await provider.requestAdditionalSms(state, activation);
+          }
+        }
+        if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_ZHUSMS) {
+          const provider = getZhuSmsProviderForState(state);
           if (provider?.requestAdditionalSms) {
             await provider.requestAdditionalSms(state, activation);
           }
@@ -4759,6 +4984,22 @@
       if (!normalizedActivation) {
         throw new Error('缺少手机号接码订单。');
       }
+      if (getActivationProviderId(normalizedActivation, state) === PHONE_SMS_PROVIDER_MANUAL) {
+        if (typeof requestManualPhoneCodeInput !== 'function') {
+          throw new Error('手动验证码输入弹窗未加载，请先打开侧边栏。');
+        }
+        const response = await requestManualPhoneCodeInput({
+          step: getActivePhoneVerificationVisibleStep(),
+          provider: PHONE_SMS_PROVIDER_MANUAL,
+          phoneNumber: normalizedActivation.phoneNumber,
+          activationId: normalizedActivation.activationId,
+        });
+        const code = normalizeManualPhoneCode(response?.code);
+        if (!code) {
+          throw new Error(`步骤 ${getActivePhoneVerificationVisibleStep()}：手动验证码输入已取消。`);
+        }
+        return code;
+      }
       if (getActivationProviderId(normalizedActivation, state) === PHONE_SMS_PROVIDER_FIVE_SIM) {
         const provider = getFiveSimProviderForState(state);
         if (provider) {
@@ -4791,6 +5032,12 @@
       }
       if (getActivationProviderId(normalizedActivation, state) === PHONE_SMS_PROVIDER_CHATGPT_API) {
         const provider = getChatGptApiProviderForState(state);
+        if (provider) {
+          return provider.pollActivationCode(state, normalizedActivation, options);
+        }
+      }
+      if (getActivationProviderId(normalizedActivation, state) === PHONE_SMS_PROVIDER_ZHUSMS) {
+        const provider = getZhuSmsProviderForState(state);
         if (provider) {
           return provider.pollActivationCode(state, normalizedActivation, options);
         }
@@ -5054,6 +5301,9 @@
     }
 
     function resolveCountryCandidatesForProvider(state = {}, providerId = normalizePhoneSmsProvider(state?.phoneSmsProvider)) {
+      if (normalizePhoneSmsProvider(providerId) === PHONE_SMS_PROVIDER_MANUAL) {
+        return [];
+      }
       if (normalizePhoneSmsProvider(providerId) === PHONE_SMS_PROVIDER_FIVE_SIM) {
         const provider = getFiveSimProviderForState(state);
         if (provider) {
@@ -5123,11 +5373,32 @@
         }
         return [];
       }
+      if (normalizePhoneSmsProvider(providerId) === PHONE_SMS_PROVIDER_ZHUSMS) {
+        const provider = getZhuSmsProviderForState(state);
+        if (provider?.resolveCountryCandidates) {
+          return provider.resolveCountryCandidates(state);
+        }
+        return [{ id: 187, label: 'USA' }];
+      }
       return resolveCountryCandidates(state);
     }
 
     function resolveCountryConfigFromActivation(activation, fallbackState = {}) {
       const providerId = getActivationProviderId(activation, fallbackState);
+      if (providerId === PHONE_SMS_PROVIDER_MANUAL) {
+        const inferredCountry = inferHeroSmsCountryFromPhoneNumber(activation?.phoneNumber);
+        if (inferredCountry) {
+          return inferredCountry;
+        }
+        const countryId = normalizeCountryId(activation?.countryId, 0);
+        if (countryId > 0) {
+          return {
+            id: countryId,
+            label: normalizeCountryLabel(activation?.countryLabel, `Country #${countryId}`),
+          };
+        }
+        return MANUAL_PHONE_DEFAULT_COUNTRY;
+      }
       const candidates = resolveCountryCandidatesForProvider(fallbackState, providerId);
       if (activation && typeof activation === 'object') {
         if (providerId === PHONE_SMS_PROVIDER_FIVE_SIM) {
@@ -5601,6 +5872,11 @@
 
     async function acquirePhoneActivation(state = {}, options = {}) {
       const provider = normalizePhoneSmsProvider(state?.phoneSmsProvider || DEFAULT_PHONE_SMS_PROVIDER);
+      if (provider === PHONE_SMS_PROVIDER_MANUAL) {
+        const activation = await requestManualPhoneActivation(state, options);
+        await resetPhoneNoSupplyFailureStreak(state);
+        return activation;
+      }
       const providerOrder = resolvePhoneProviderOrder(state, provider);
       const countryCandidates = resolveCountryCandidatesForProvider(state, provider);
       if (
@@ -6554,6 +6830,14 @@
               if (attempt >= DEFAULT_PHONE_SUBMIT_ATTEMPTS) {
                 throw new Error(`步骤 4：手机验证码连续 ${DEFAULT_PHONE_SUBMIT_ATTEMPTS} 次被拒绝：${invalidErrorText}`);
               }
+              if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_MANUAL) {
+                await addLog(
+                  `步骤 4：手动验证码被拒绝，请重新输入。${invalidErrorText ? ` ${invalidErrorText}` : ''}`.trim(),
+                  'warn',
+                  { step: 4, stepKey: 'fetch-signup-code' }
+                );
+                continue;
+              }
 
               await requestAdditionalPhoneSms(state, activation);
               try {
@@ -6797,6 +7081,14 @@
               const invalidErrorText = String(submitResult.errorText || submitResult.url || '未知错误').trim();
               if (attempt >= DEFAULT_PHONE_SUBMIT_ATTEMPTS) {
                 throw new Error(`步骤 ${visibleStep}：登录手机验证码连续 ${DEFAULT_PHONE_SUBMIT_ATTEMPTS} 次被拒绝：${invalidErrorText}`);
+              }
+              if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_MANUAL) {
+                await addLog(
+                  `步骤 ${visibleStep}：手动验证码被拒绝，请重新输入。${invalidErrorText ? ` ${invalidErrorText}` : ''}`.trim(),
+                  'warn',
+                  { step: visibleStep, stepKey: 'fetch-login-code' }
+                );
+                continue;
               }
 
               await requestAdditionalPhoneSms(state, activation);
@@ -7469,6 +7761,14 @@
                   'warn'
                 );
                 break;
+              }
+
+              if (getActivationProviderId(activation, state) === PHONE_SMS_PROVIDER_MANUAL) {
+                await addLog(
+                  `步骤 9：手动验证码被拒绝，请重新输入。${invalidErrorText ? ` ${invalidErrorText}` : ''}`.trim(),
+                  'warn'
+                );
+                continue;
               }
 
               if (remainingResendRequests > 0) {

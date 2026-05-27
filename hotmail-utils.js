@@ -94,7 +94,8 @@
     ]);
     const subject = firstNonEmptyString([message?.subject]);
     const preview = firstNonEmptyString([message?.bodyPreview, message?.preview, message?.text]);
-    return extractVerificationCode([subject, preview, sender].filter(Boolean).join(' '), {
+    const body = typeof message?.body === 'string' ? message.body : (message?.body?.content || '');
+    return extractVerificationCode([subject, preview, body, sender].filter(Boolean).join(' '), {
       codePatterns: options?.codePatterns,
     });
   }
@@ -192,7 +193,8 @@
     const sender = normalizeText(message?.from?.emailAddress?.address);
     const subject = normalizeText(message?.subject);
     const preview = String(message?.bodyPreview || '');
-    const combinedText = [subject, sender, preview].filter(Boolean).join(' ');
+    const body = typeof message?.body === 'string' ? message.body : (message?.body?.content || '');
+    const combinedText = [subject, sender, preview, body].filter(Boolean).join(' ');
     const code = extractVerificationCode(combinedText, {
       codePatterns: filters.codePatterns,
     });
@@ -343,6 +345,7 @@
   }
 
   function normalizeHotmailMailApiMessage(message = {}) {
+    const bodyContent = typeof message?.body === 'string' ? message.body : (message?.body?.content || '');
     return {
       id: firstNonEmptyString([message.id, message.message_id, message.messageId, message.internetMessageId]),
       subject: firstNonEmptyString([message.subject, message.title]),
@@ -362,9 +365,10 @@
         message.preview,
         message.snippet,
         message.text,
-        message.body,
+        bodyContent,
         stripHtmlTags(message.html || message.content || ''),
       ]),
+      body: bodyContent ? { content: bodyContent } : undefined,
       receivedDateTime: firstNonEmptyString([
         message.receivedDateTime,
         message.received_at,

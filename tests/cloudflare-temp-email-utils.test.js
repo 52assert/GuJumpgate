@@ -49,3 +49,67 @@ test('Cloudflare Temp Email reads nested content objects instead of stringifying
   assert.equal(messages[0].bodyPreview.includes('654321'), true);
   assert.equal(hotmailUtils.extractVerificationCodeFromMessage(messages[0]), '654321');
 });
+
+test('Hotmail verification picker skips newer non-code mail and reads message body content', () => {
+  const messages = [
+    {
+      id: 'newer-newsletter',
+      mailbox: 'INBOX',
+      from: { emailAddress: { address: 'digest@example.com' } },
+      subject: 'Daily digest',
+      bodyPreview: 'No code here.',
+      receivedDateTime: '2026-05-21T00:31:00.000Z',
+    },
+    {
+      id: 'older-code',
+      mailbox: 'Junk',
+      from: { emailAddress: { address: 'noreply@tm.openai.com' } },
+      subject: 'Your ChatGPT code',
+      bodyPreview: 'Open the message to continue.',
+      body: {
+        content: '<p>Your ChatGPT code is 782914</p>',
+      },
+      receivedDateTime: '2026-05-21T00:30:00.000Z',
+    },
+  ];
+
+  assert.equal(hotmailUtils.extractVerificationCodeFromMessage(messages[0]), null);
+
+  const matchResult = hotmailUtils.pickVerificationMessageWithTimeFallback(messages, {
+    afterTimestamp: Date.UTC(2026, 4, 21, 0, 29, 0),
+    senderFilters: ['openai'],
+    subjectFilters: ['code'],
+    requiredKeywords: ['chatgpt'],
+  });
+
+  assert.equal(matchResult.match.code, '782914');
+  assert.equal(matchResult.match.message.id, 'older-code');
+});
+
+test('Hotmail manual fallback can copy a recent code even when OpenAI hints miss', () => {
+  const messages = [
+    {
+      id: 'recent-code',
+      mailbox: 'INBOX',
+      from: { emailAddress: { address: 'security@example-mail.test' } },
+      subject: '安全确认',
+      bodyPreview: '你的验证码是 341290，请尽快使用。',
+      receivedDateTime: '2026-05-21T00:32:00.000Z',
+    },
+  ];
+
+  const strictResult = hotmailUtils.pickVerificationMessageWithTimeFallback(messages, {
+    afterTimestamp: Date.UTC(2026, 4, 21, 0, 31, 0),
+    senderFilters: ['openai'],
+    subjectFilters: ['chatgpt'],
+    requiredKeywords: ['login'],
+  });
+  assert.equal(strictResult.match, null);
+
+  const relaxedResult = hotmailUtils.pickVerificationMessage(messages, {
+    afterTimestamp: Date.UTC(2026, 4, 21, 0, 31, 0),
+  });
+
+  assert.equal(relaxedResult.code, '341290');
+  assert.equal(relaxedResult.message.id, 'recent-code');
+});

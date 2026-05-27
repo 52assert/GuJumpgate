@@ -1712,16 +1712,8 @@
         Number.isFinite(Number(amountSummary.amount)) ? String(amountSummary.amount) : '未知金额'
       );
       const stopReason = `步骤 7：${phaseLabel}检测到今日应付金额不是 0（${amountLabel}），说明当前账号没有免费试用资格。`;
-      if (isSmsOauthCheckoutState(state)) {
-        const checkoutStep = getCheckoutBillingDisplayStep(state);
-        await addLog(`${stopReason} 先手机号注册 OAuth 将保留当前注册流程，直接回到第 ${checkoutStep} 步重新创建 Checkout。`, 'warn');
-        throw new Error(`PLUS_CHECKOUT_NON_FREE_TRIAL::${stopReason}`);
-      }
-      const shouldRetryNonFreeTrial = Boolean(state?.autoRunRetryNonFreeTrial);
       await addLog(
-        shouldRetryNonFreeTrial
-          ? `${stopReason} 无试用套餐自动重试已开启，将换新邮箱重走流程。`
-          : `${stopReason}已自动停止整个流程。`,
+        `${stopReason} 当前轮将直接结束并进入下一号，不再针对无免费试用资格自动重试。`,
         'warn'
       );
       if (typeof markCurrentRegistrationAccountUsed === 'function') {
@@ -1729,13 +1721,6 @@
           reason: 'plus-checkout-non-free-trial',
           logPrefix: 'Plus Checkout：当前账号没有免费试用资格',
         });
-      }
-      if (shouldRetryNonFreeTrial) {
-        throw new Error(`PLUS_CHECKOUT_NON_FREE_TRIAL::${stopReason}`);
-      }
-      if (typeof requestStop === 'function') {
-        await requestStop({ logMessage: false });
-        throw new Error('流程已被用户停止。');
       }
       throw new Error(`PLUS_CHECKOUT_NON_FREE_TRIAL::${stopReason}`);
     }

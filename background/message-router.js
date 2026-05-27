@@ -211,21 +211,6 @@
         return;
       }
 
-      if (
-        Object.prototype.hasOwnProperty.call(updates, 'phoneSmsReuseEnabled')
-        || Object.prototype.hasOwnProperty.call(updates, 'heroSmsReuseEnabled')
-      ) {
-        const currentReuseEnabled = currentState?.phoneSmsReuseEnabled ?? currentState?.heroSmsReuseEnabled;
-        if (currentReuseEnabled !== undefined) {
-          const normalizedReuseEnabled = Boolean(currentReuseEnabled);
-          updates.phoneSmsReuseEnabled = normalizedReuseEnabled;
-          updates.heroSmsReuseEnabled = normalizedReuseEnabled;
-        } else {
-          delete updates.phoneSmsReuseEnabled;
-          delete updates.heroSmsReuseEnabled;
-        }
-      }
-
       preserveKeyFromState(updates, currentState, 'freePhoneReuseEnabled');
       preserveKeyFromState(updates, currentState, 'freePhoneReuseAutoEnabled');
       preserveKeyFromState(updates, currentState, 'phonePreferredActivation');
@@ -2174,6 +2159,7 @@
         }
 
         case 'TEST_HOTMAIL_ACCOUNT': {
+          clearStopRequest();
           const result = await testHotmailAccountMailAccess(String(message.payload?.accountId || ''));
           return { ok: true, ...result };
         }
@@ -2311,6 +2297,7 @@
         }
 
         case 'FETCH_HOSTED_CHECKOUT_VERIFICATION_CODE': {
+          clearStopRequest();
           if (typeof fetchHostedCheckoutVerificationCodeManually !== 'function') {
             throw new Error('Hosted checkout 手动获取验证码能力尚未接入。');
           }

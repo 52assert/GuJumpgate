@@ -186,6 +186,87 @@
       return String(value || '').trim().toLowerCase();
     }
 
+    function normalizeCustomMailProviderPool(value = []) {
+      const source = Array.isArray(value)
+        ? value
+        : String(value || '').split(/[\r\n,，;；]+/);
+
+      return source
+        .map((item) => String(item || '').trim().toLowerCase())
+        .filter((item) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(item));
+    }
+
+    function normalizeCustomMailProviderPoolEntryObjects(value = []) {
+      const source = Array.isArray(value) ? value : [];
+      const seenEmails = new Set();
+      const entries = [];
+
+      for (const rawEntry of source) {
+        const asObject = rawEntry && typeof rawEntry === 'object'
+          ? rawEntry
+          : { email: rawEntry };
+        const email = String(asObject.email || '').trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+          continue;
+        }
+        if (seenEmails.has(email)) {
+          continue;
+        }
+        seenEmails.add(email);
+        entries.push({
+          email,
+          enabled: asObject.enabled !== undefined ? Boolean(asObject.enabled) : true,
+          used: Boolean(asObject.used),
+        });
+      }
+
+      return entries;
+    }
+
+    function getCustomMailProviderPool(state = {}) {
+      const entries = normalizeCustomMailProviderPoolEntryObjects(state?.customMailProviderPoolEntries);
+      if (entries.length > 0) {
+        return entries
+          .filter((entry) => entry.enabled && !entry.used)
+          .map((entry) => entry.email);
+      }
+      if (Array.isArray(state?.customMailProviderPoolEntries)) {
+        return [];
+      }
+      return normalizeCustomMailProviderPool(state?.customMailProviderPool);
+    }
+
+    function getCustomMailProviderPoolEmailForRun(state = {}, targetRun = 1) {
+      const entries = getCustomMailProviderPool(state);
+      const numericRun = Math.max(1, Math.floor(Number(targetRun) || 1));
+      return entries[numericRun - 1] || '';
+    }
+
+    async function fetchCustomMailProviderPoolEmail(state, options = {}) {
+      throwIfStopped();
+      const latestState = state || await getState();
+      const requestedRun = Math.max(
+        1,
+        Math.floor(Number(options.poolIndex ?? latestState.autoRunCurrentRun ?? 1) || 1)
+      );
+      const email = getCustomMailProviderPoolEmailForRun(latestState, requestedRun);
+      if (!email) {
+        const poolSize = getCustomMailProviderPool(latestState).length;
+        throw new Error(
+          poolSize > 0
+            ? `自定义邮箱号池第 ${requestedRun} 个邮箱不存在，请检查号池数量是否与自动轮数一致。`
+            : '当前邮箱服务为自定义邮箱，但自定义号池为空，请直接填写注册邮箱或先配置自定义号池。'
+        );
+      }
+
+      await persistResolvedEmailState(latestState, email, {
+        source: 'custom-mail-provider-pool',
+        preserveAccountIdentity: Boolean(options?.preserveAccountIdentity),
+      });
+      await addLog(`自定义邮箱号池：已取用 ${email}`, 'ok');
+      return email;
+    }
+
     async function fetchDuckEmail(options = {}) {
       throwIfStopped();
       const {
@@ -305,6 +386,15 @@
       }
       if (options.customEmailPool !== undefined) {
         mergedState.customEmailPool = options.customEmailPool;
+      }
+      if (options.customMailProviderPool !== undefined) {
+        mergedState.customMailProviderPool = options.customMailProviderPool;
+      }
+      if (options.customMailProviderPoolEntries !== undefined) {
+        mergedState.customMailProviderPoolEntries = options.customMailProviderPoolEntries;
+      }
+      if (provider === 'custom') {
+        return fetchCustomMailProviderPoolEmail(mergedState, options);
       }
       if (generator === 'custom') {
         throw new Error('当前邮箱生成方式为自定义邮箱，请直接填写注册邮箱。');

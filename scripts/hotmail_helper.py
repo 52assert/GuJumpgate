@@ -24,6 +24,8 @@ ENTRA_COMMON_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/t
 ENTRA_CONSUMERS_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
 GRAPH_API_ORIGIN = "https://graph.microsoft.com"
 OUTLOOK_API_ORIGIN = "https://outlook.office.com"
+ZHUSMS_DEFAULT_BASE_URL = "https://zhusms.com"
+ZHUSMS_ALLOWED_PATHS = {"/api/order/take", "/api/order/status"}
 GRAPH_SCOPES = "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/User.Read"
 GRAPH_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
 TOKEN_ENDPOINTS = {
@@ -140,6 +142,109 @@ def get_json(url, headers=None):
     request = Request(url, headers=headers or {})
     with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
         return response.getcode(), json.loads(response.read().decode("utf-8"))
+
+
+def parse_json_text(text):
+    stripped = str(text or "").strip()
+    if not stripped:
+        return {}
+    try:
+        return json.loads(stripped)
+    except Exception:
+        return stripped
+
+
+def normalize_zhusms_sid(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"(?:^|;\s*)zhusms_sid=([^;]+)", text, flags=re.I)
+    raw = match.group(1) if match else re.sub(r"^zhusms_sid\s*=\s*", "", text, flags=re.I).split(";")[0]
+    return re.sub(r"[\r\n;]+", "", raw).strip()
+
+
+def normalize_zhusms_base_url(value):
+    text = str(value or "").strip() or ZHUSMS_DEFAULT_BASE_URL
+    try:
+        parsed = urlparse(text)
+    except Exception:
+        return ZHUSMS_DEFAULT_BASE_URL
+    if parsed.scheme != "https" or parsed.netloc.lower() != "zhusms.com":
+        return ZHUSMS_DEFAULT_BASE_URL
+    return ZHUSMS_DEFAULT_BASE_URL
+
+
+def proxy_zhusms_request(payload):
+    if not isinstance(payload, dict):
+        raise RuntimeError("Invalid ZhuSMS proxy payload")
+
+    sid = normalize_zhusms_sid(payload.get("sid") or payload.get("cookie"))
+    if not sid:
+        raise RuntimeError("Missing zhusms_sid")
+
+    method = str(payload.get("method") or "GET").strip().upper()
+    if method not in {"GET", "POST"}:
+        raise RuntimeError(f"Unsupported ZhuSMS method: {method}")
+
+    base_url = normalize_zhusms_base_url(payload.get("baseUrl"))
+    raw_path = str(payload.get("path") or "").strip()
+    if not raw_path.startswith("/"):
+        raise RuntimeError("ZhuSMS path must start with /")
+    parsed_path = urlparse(raw_path)
+    if parsed_path.path not in ZHUSMS_ALLOWED_PATHS:
+        raise RuntimeError(f"Unsupported ZhuSMS path: {parsed_path.path}")
+
+    target_url = f"{base_url}{parsed_path.path}"
+    if parsed_path.query:
+        target_url = f"{target_url}?{parsed_path.query}"
+
+    body_text = str(payload.get("body") or "")
+    data = body_text.encode("utf-8") if method == "POST" else None
+    content_type = "application/x-www-form-urlencoded;charset=UTF-8"
+    incoming_headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
+    if incoming_headers.get("Content-Type"):
+        content_type = str(incoming_headers.get("Content-Type"))
+    if incoming_headers.get("content-type"):
+        content_type = str(incoming_headers.get("content-type"))
+
+    headers = {
+        "Accept": "application/json,*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Cookie": f"zhusms_sid={sid}",
+        "Origin": base_url,
+        "Referer": f"{base_url}/",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+    }
+    if method == "POST":
+        headers["Content-Type"] = content_type
+
+    started_at = time.monotonic()
+    request = Request(target_url, data=data, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            response_text = response.read().decode("utf-8", errors="replace")
+            return {
+                "ok": True,
+                "status": response.getcode(),
+                "payload": parse_json_text(response_text),
+                "elapsedMs": int((time.monotonic() - started_at) * 1000),
+            }
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return {
+            "ok": False,
+            "status": getattr(exc, "code", None),
+            "error": compact_text(detail or str(exc), 1000),
+            "payload": parse_json_text(detail),
+            "elapsedMs": int((time.monotonic() - started_at) * 1000),
+        }
+    except URLError as exc:
+        return {
+            "ok": False,
+            "status": None,
+            "error": compact_text(f"ZhuSMS request failed: {exc}", 1000),
+            "elapsedMs": int((time.monotonic() - started_at) * 1000),
+        }
 
 
 def mask_secret(value, keep=6):
@@ -603,6 +708,7 @@ def normalize_graph_message(message, mailbox):
     sender = message.get("from", {}) or {}
     email_addr = sender.get("emailAddress", {}) if isinstance(sender, dict) else {}
     received = str(message.get("receivedDateTime") or "").strip()
+    body_content = get_message_body_content(message)
     return {
         "id": str(message.get("id") or message.get("internetMessageId") or "").strip(),
         "mailbox": mailbox,
@@ -614,6 +720,7 @@ def normalize_graph_message(message, mailbox):
             }
         },
         "bodyPreview": str(message.get("bodyPreview") or "").strip(),
+        "body": {"content": body_content} if body_content else {},
         "receivedDateTime": received,
         "receivedTimestamp": int(datetime.fromisoformat(received.replace("Z", "+00:00")).timestamp() * 1000) if received else 0,
     }
@@ -625,6 +732,7 @@ def normalize_outlook_message(message, mailbox):
     if isinstance(sender, dict) and not email_addr:
         email_addr = sender.get("emailAddress", {}) if isinstance(sender, dict) else {}
     received = str(message.get("ReceivedDateTime") or message.get("receivedDateTime") or "").strip()
+    body_content = get_message_body_content(message)
     return {
         "id": str(message.get("Id") or message.get("id") or "").strip(),
         "mailbox": mailbox,
@@ -636,6 +744,7 @@ def normalize_outlook_message(message, mailbox):
             }
         },
         "bodyPreview": str(message.get("BodyPreview") or message.get("bodyPreview") or "").strip(),
+        "body": {"content": body_content} if body_content else {},
         "receivedDateTime": received,
         "receivedTimestamp": int(datetime.fromisoformat(received.replace("Z", "+00:00")).timestamp() * 1000) if received else 0,
     }
@@ -645,7 +754,7 @@ def fetch_graph_messages(access_token, mailbox="INBOX", top=FETCH_LIMIT_DEFAULT)
     mailbox_id = normalize_mailbox_id(mailbox)
     query = urlencode({
         "$top": max(1, min(int(top or FETCH_LIMIT_DEFAULT), 30)),
-        "$select": "id,internetMessageId,subject,from,bodyPreview,receivedDateTime",
+        "$select": "id,internetMessageId,subject,from,bodyPreview,body,receivedDateTime",
         "$orderby": "receivedDateTime desc",
     })
     url = f"{GRAPH_API_ORIGIN}/v1.0/me/mailFolders/{mailbox_id}/messages?{query}"
@@ -668,7 +777,7 @@ def fetch_outlook_api_messages(access_token, mailbox="INBOX", top=FETCH_LIMIT_DE
     mailbox_id = normalize_mailbox_id(mailbox)
     query = urlencode({
         "$top": max(1, min(int(top or FETCH_LIMIT_DEFAULT), 30)),
-        "$select": "Id,Subject,From,BodyPreview,ReceivedDateTime",
+        "$select": "Id,Subject,From,BodyPreview,Body,ReceivedDateTime",
         "$orderby": "ReceivedDateTime desc",
     })
     url = f"{OUTLOOK_API_ORIGIN}/api/v2.0/me/mailfolders/{mailbox_id}/messages?{query}"
@@ -908,6 +1017,11 @@ class HotmailHelperHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "filePath": file_path,
                 })
+                return
+
+            if request_path == "/zhusms":
+                result = proxy_zhusms_request(payload)
+                json_response(self, 200 if result.get("ok") else 502, result)
                 return
 
             email_addr = str(payload.get("email") or "").strip()

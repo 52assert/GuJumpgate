@@ -77,7 +77,7 @@
 
     async function restartGoPayCheckoutFromStep6(tabId, reason = '') {
       const message = normalizeText(reason || 'GoPay 支付页已失效或点击后没有进入下一步。');
-      await addLog(`步骤 8：${message} 正在关闭当前 GoPay/Checkout 页面，并回到步骤 6 重新创建 Plus Checkout。`, 'warn');
+      await addLog(`步骤 8：${message} 正在关闭当前 GoPay/Checkout 页面，并准备重新发起支付链路。`, 'warn');
       if (Number.isInteger(tabId) && chrome?.tabs?.remove) {
         await chrome.tabs.remove(tabId).catch(() => {});
       }
@@ -88,7 +88,7 @@
         plusPaypalApprovedAt: null,
         plusGoPayApprovedAt: null,
       });
-      throw new Error(`GOPAY_RESTART_FROM_STEP6::步骤 8：${message} 已关闭当前支付页，请从步骤 6 重新创建 Plus Checkout。`);
+      throw new Error(`GOPAY_RESTART_FROM_STEP6::步骤 8：${message} 已关闭当前支付页，请重新发起支付链路。`);
     }
 
     async function handleGoPayTerminalError(pageState = {}, tabId = null) {

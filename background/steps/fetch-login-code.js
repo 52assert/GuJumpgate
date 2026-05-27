@@ -532,7 +532,16 @@
         throw new Error(`步骤 ${visibleStep}：绑定邮箱步骤只处理添加邮箱页，当前状态：${pageState?.state || 'unknown'}。URL: ${pageState?.url || ''}`.trim());
       }
 
-      const addEmailPreparation = await submitAddEmailIfNeeded(state, visibleStep, pageState);
+      let addEmailPreparation;
+      try {
+        addEmailPreparation = await submitAddEmailIfNeeded(state, visibleStep, pageState);
+      } catch (error) {
+        const message = error?.message || String(error || '');
+        if (/没有可用的\s*Hotmail\s*账号|请先在侧边栏添加至少一个带刷新令牌/i.test(message)) {
+          throw new Error(`绑定邮箱无法继续：${message}`);
+        }
+        throw error;
+      }
       const preparedState = addEmailPreparation?.state || state;
       const nextPageState = addEmailPreparation?.pageState || pageState;
       if (nextPageState?.state !== 'verification_page') {

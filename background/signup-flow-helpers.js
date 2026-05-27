@@ -347,6 +347,7 @@
         const account = await ensureHotmailAccountForFlow({
           allowAllocate: true,
           allowUsedCurrent: preserveAccountIdentity,
+          allowPendingVerification: preserveAccountIdentity,
           markUsed: !preserveAccountIdentity,
           preferredAccountId: state.currentHotmailAccountId || null,
         });
