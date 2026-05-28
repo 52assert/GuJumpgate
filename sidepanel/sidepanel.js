@@ -3144,6 +3144,9 @@ function normalizeSupportedMailProvider(value = '') {
   if (normalized === 'custom' || normalized === 'manual') {
     return 'custom';
   }
+  if (normalized === 'custom-icloud') {
+    return 'custom-icloud';
+  }
   if (normalized === CLOUDFLARE_TEMP_EMAIL_PROVIDER) {
     return CLOUDFLARE_TEMP_EMAIL_PROVIDER;
   }
@@ -12204,8 +12207,13 @@ function syncPasswordField(state) {
   inputPassword.value = state?.contributionMode ? '' : (state.customPassword || '');
 }
 
+function isCustomIcloudMailProvider(provider = selectMailProvider.value) {
+  return String(provider || '').trim().toLowerCase() === 'custom-icloud';
+}
+
 function isCustomMailProvider(provider = selectMailProvider.value) {
-  return String(provider || '').trim().toLowerCase() === 'custom';
+  const normalized = String(provider || '').trim().toLowerCase();
+  return normalized === 'custom' || normalized === 'custom-icloud';
 }
 
 function isLuckmailProvider(provider = selectMailProvider.value) {
@@ -13063,7 +13071,10 @@ function updateMailProviderUI() {
       : '请先在邮箱池里每行填写一个邮箱，自动轮数会跟随数量';
   }
   if (autoHintText && useCustomEmail && useCustomMailProviderPool) {
-    autoHintText.textContent = `当前自定义号池共 ${getCustomMailProviderPoolSize()} 个邮箱，自动轮数会跟随数量；第 4/8 步仍需手动输入验证码`;
+    const customPoolCodeNote = isCustomIcloudMailProvider()
+      ? '第 4/8 步将自动调用接口获取验证码'
+      : '第 4/8 步仍需手动输入验证码';
+    autoHintText.textContent = `当前自定义号池共 ${getCustomMailProviderPoolSize()} 个邮箱，自动轮数会跟随数量；${customPoolCodeNote}`;
   }
   if (autoHintText && useGmail && useGeneratedAlias) {
     autoHintText.textContent = '请先填写 Gmail 原邮箱，步骤 3 会自动生成 Gmail +tag 地址';

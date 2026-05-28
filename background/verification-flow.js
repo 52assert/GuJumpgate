@@ -3,6 +3,10 @@
 })(typeof self !== 'undefined' ? self : globalThis, function createBackgroundVerificationFlowModule() {
   const ICLOUD_MAIL_POLL_MIN_ATTEMPTS = 5;
   const ICLOUD_MAIL_POLL_TIMEOUT_MARGIN_MS = 25000;
+  const CUSTOM_ICLOUD_VERIFICATION_API_URL = 'https://eamil.52assert.workers.dev/?token=abc123xyz';
+  const CUSTOM_ICLOUD_POLL_INTERVAL_MS = 3000;
+  const CUSTOM_ICLOUD_MAX_POLL_ATTEMPTS = 40;
+  const CUSTOM_ICLOUD_MAX_SUBMIT_ATTEMPTS = 5;
 
   function createVerificationFlowHelpers(deps = {}) {
     const {
@@ -1271,6 +1275,96 @@
       return result || {};
     }
 
+    async function fetchCustomIcloudVerificationCode() {
+      const response = await fetch(CUSTOM_ICLOUD_VERIFICATION_API_URL, {
+        method: 'GET',
+        cache: 'no-store',
+      });
+      if (!response.ok) {
+        throw new Error(`接口返回状态 ${response.status}`);
+      }
+      let data = null;
+      try {
+        data = await response.json();
+      } catch (_) {
+        throw new Error('接口返回内容无法解析为 JSON。');
+      }
+      return String(data?.code || '').trim();
+    }
+
+    async function resolveCustomIcloudVerificationStep(step, options = {}) {
+      const completionStep = getCompletionStep(step, options);
+      activeVerificationLogStep = completionStep;
+      const stateKey = getVerificationCodeStateKey(step);
+      const verificationLabel = getVerificationCodeLabel(step);
+      const state = typeof getState === 'function' ? await getState() : {};
+      const rejectedCodes = new Set();
+      const persistedCode = String(state?.[stateKey] || '').trim();
+      if (persistedCode) {
+        rejectedCodes.add(persistedCode);
+      }
+
+      await addLog(`步骤 ${completionStep}：自定义邮箱（icloud）模式，正在调用接口自动获取${verificationLabel}验证码...`, 'info');
+
+      let submitAttempts = 0;
+      for (let attempt = 1; attempt <= CUSTOM_ICLOUD_MAX_POLL_ATTEMPTS; attempt++) {
+        throwIfStopped();
+
+        let code = '';
+        try {
+          code = await fetchCustomIcloudVerificationCode();
+        } catch (err) {
+          await addLog(`步骤 ${completionStep}：接口获取验证码失败（${attempt}/${CUSTOM_ICLOUD_MAX_POLL_ATTEMPTS}）：${err.message}`, 'warn');
+          await sleepWithStop(CUSTOM_ICLOUD_POLL_INTERVAL_MS);
+          continue;
+        }
+
+        if (!code || rejectedCodes.has(code)) {
+          await sleepWithStop(CUSTOM_ICLOUD_POLL_INTERVAL_MS);
+          continue;
+        }
+
+        throwIfStopped();
+        await addLog(`步骤 ${completionStep}：已通过接口获取${verificationLabel}验证码：${code}`);
+        submitAttempts += 1;
+        const submitResult = await submitVerificationCode(step, code, options);
+
+        if (submitResult.invalidCode) {
+          rejectedCodes.add(code);
+          await addLog(`步骤 ${completionStep}：验证码被页面拒绝：${submitResult.errorText || code}`, 'warn');
+          if (submitAttempts >= CUSTOM_ICLOUD_MAX_SUBMIT_ATTEMPTS) {
+            throw new Error(`步骤 ${completionStep}：自定义邮箱（icloud）验证码连续失败，已达到 ${CUSTOM_ICLOUD_MAX_SUBMIT_ATTEMPTS} 次重试上限。`);
+          }
+          await sleepWithStop(CUSTOM_ICLOUD_POLL_INTERVAL_MS);
+          continue;
+        }
+
+        await setState({
+          lastEmailTimestamp: Date.now(),
+          [stateKey]: code,
+        });
+
+        const completionNodeId = await getNodeIdForStep(completionStep);
+        if (!completionNodeId) {
+          throw new Error(`步骤 ${completionStep} 未映射到验证码节点。`);
+        }
+        await completeNodeFromBackground(completionNodeId, {
+          code,
+          phoneVerificationRequired: Boolean(submitResult.addPhonePage),
+          ...(step === 4 && submitResult?.skipProfileStep ? { skipProfileStep: true } : {}),
+          ...(step === 4 && submitResult?.skipProfileStepReason
+            ? { skipProfileStepReason: submitResult.skipProfileStepReason }
+            : {}),
+        });
+        return {
+          phoneVerificationRequired: Boolean(submitResult.addPhonePage),
+          url: submitResult.url || '',
+        };
+      }
+
+      throw new Error(`步骤 ${completionStep}：自定义邮箱（icloud）在限定时间内未获取到有效${verificationLabel}验证码，请检查接口或邮箱转发是否正常。`);
+    }
+
     async function resolveVerificationStep(step, state, mail, options = {}) {
       const completionStep = getCompletionStep(step, options);
       activeVerificationLogStep = completionStep;
@@ -1454,6 +1548,7 @@
         pollFreshVerificationCode,
         pollFreshVerificationCodeWithResendInterval,
         requestVerificationCodeResend,
+        resolveCustomIcloudVerificationStep,
         resolveVerificationStep,
         submitVerificationCode,
       };

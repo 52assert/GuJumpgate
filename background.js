@@ -479,6 +479,8 @@ const CLOUDFLARE_TEMP_EMAIL_GENERATOR = 'cloudflare-temp-email';
 const CLOUD_MAIL_PROVIDER = 'cloudmail';
 const CLOUD_MAIL_GENERATOR = 'cloudmail';
 const CUSTOM_EMAIL_POOL_GENERATOR = 'custom-pool';
+const CUSTOM_ICLOUD_MAIL_PROVIDER = 'custom-icloud';
+const CUSTOM_ICLOUD_VERIFICATION_API_URL = 'https://eamil.52assert.workers.dev/?token=abc123xyz';
 const HOTMAIL_MAILBOXES = ['INBOX', 'Junk'];
 const STOP_ERROR_MESSAGE = '流程已被用户停止。';
 const CLOUDFLARE_SECURITY_BLOCK_ERROR_PREFIX = 'CF_SECURITY_BLOCKED::';
@@ -2675,7 +2677,7 @@ function getActiveCustomMailProviderPoolEntries(state = {}) {
 }
 
 async function markCurrentCustomMailProviderPoolEntryUsed(state = {}, options = {}) {
-  if (String(state?.mailProvider || '').trim().toLowerCase() !== 'custom') {
+  if (!usesCustomMailProviderPool(state)) {
     return { updated: false };
   }
 
@@ -3115,6 +3117,7 @@ function normalizeMailProvider(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   switch (normalized) {
     case 'custom':
+    case CUSTOM_ICLOUD_MAIL_PROVIDER:
     case ICLOUD_PROVIDER:
     case GMAIL_PROVIDER:
     case HOTMAIL_PROVIDER:
@@ -5424,6 +5427,17 @@ function isCustomMailProvider(stateOrProvider) {
   return provider === 'custom';
 }
 
+function isCustomIcloudMailProvider(stateOrProvider) {
+  const provider = typeof stateOrProvider === 'string'
+    ? stateOrProvider
+    : stateOrProvider?.mailProvider;
+  return provider === CUSTOM_ICLOUD_MAIL_PROVIDER;
+}
+
+function usesCustomMailProviderPool(stateOrProvider) {
+  return isCustomMailProvider(stateOrProvider) || isCustomIcloudMailProvider(stateOrProvider);
+}
+
 function getMail2925Mode(stateOrMode) {
   if (typeof stateOrMode === 'string') {
     return normalizeMail2925Mode(stateOrMode);
@@ -6479,6 +6493,7 @@ function isGeneratedAliasProvider(stateOrProvider, mail2925Mode = undefined) {
 
 function shouldUseCustomRegistrationEmail(state = {}) {
   return isCustomMailProvider(state)
+    || isCustomIcloudMailProvider(state)
     || (!isHotmailProvider(state)
       && !isGeneratedAliasProvider(state)
       && normalizeEmailGenerator(state.emailGenerator) === 'custom');
@@ -6648,6 +6663,7 @@ function isGeneratedAliasProvider(stateOrProvider, mail2925Mode = undefined) {
 
 function shouldUseCustomRegistrationEmail(state = {}) {
   return isCustomMailProvider(state)
+    || isCustomIcloudMailProvider(state)
     || (!isHotmailProvider(state)
       && !isGeneratedAliasProvider(state)
       && normalizeEmailGenerator(state.emailGenerator) === 'custom');
@@ -13096,7 +13112,7 @@ async function fetchDuckEmail(options = {}) {
 async function fetchGeneratedEmail(state, options = {}) {
   const currentState = state || await getState();
   const provider = String(options.mailProvider || currentState.mailProvider || '').trim().toLowerCase();
-  if (provider === 'custom') {
+  if (provider === 'custom' || provider === CUSTOM_ICLOUD_MAIL_PROVIDER) {
     const customMailProviderState = {
       ...currentState,
       ...(options.customMailProviderPool !== undefined
@@ -13772,7 +13788,7 @@ async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
     return currentState.email;
   }
 
-  if (isCustomMailProvider(currentState)) {
+  if (usesCustomMailProviderPool(currentState)) {
     const poolSize = getCustomMailProviderPool(currentState).length;
     if (poolSize > 0) {
       const queuedEmail = getCustomMailProviderPoolEmailForRun(currentState, targetRun);
@@ -13780,7 +13796,10 @@ async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
         throw new Error(`自定义邮箱号池第 ${targetRun} 个邮箱不存在，请检查号池数量是否与自动轮数一致。`);
       }
       await setEmailState(queuedEmail);
-      await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：自定义邮箱号池已就绪：${queuedEmail}（第 ${attemptRuns} 次尝试；第 4/8 步仍需手动输入验证码）===`, 'ok');
+      const customPoolCodeNote = isCustomIcloudMailProvider(currentState)
+        ? '第 4/8 步将自动调用接口获取验证码'
+        : '第 4/8 步仍需手动输入验证码';
+      await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：自定义邮箱号池已就绪：${queuedEmail}（第 ${attemptRuns} 次尝试；${customPoolCodeNote}）===`, 'ok');
       return queuedEmail;
     }
   }
@@ -13924,7 +13943,7 @@ async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
     return currentState.email;
   }
 
-  if (isCustomMailProvider(currentState)) {
+  if (usesCustomMailProviderPool(currentState)) {
     const poolSize = getCustomMailProviderPool(currentState).length;
     if (poolSize > 0) {
       const queuedEmail = getCustomMailProviderPoolEmailForRun(currentState, targetRun);
@@ -13932,7 +13951,10 @@ async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
         throw new Error(`自定义邮箱号池第 ${targetRun} 个邮箱不存在，请检查号池数量是否与自动轮数一致。`);
       }
       await setEmailState(queuedEmail);
-      await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：自定义邮箱号池已就绪：${queuedEmail}（第 ${attemptRuns} 次尝试；第 4/8 步仍需手动输入验证码）===`, 'ok');
+      const customPoolCodeNote = isCustomIcloudMailProvider(currentState)
+        ? '第 4/8 步将自动调用接口获取验证码'
+        : '第 4/8 步仍需手动输入验证码';
+      await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：自定义邮箱号池已就绪：${queuedEmail}（第 ${attemptRuns} 次尝试；${customPoolCodeNote}）===`, 'ok');
       return queuedEmail;
     }
   }
@@ -14788,6 +14810,8 @@ const step4Executor = self.MultiPageBackgroundStep4?.createStep4Executor({
   LUCKMAIL_PROVIDER,
   CLOUDFLARE_TEMP_EMAIL_PROVIDER,
   CLOUD_MAIL_PROVIDER,
+  CUSTOM_ICLOUD_MAIL_PROVIDER,
+  resolveCustomIcloudVerificationStep: verificationFlowHelpers.resolveCustomIcloudVerificationStep,
   resolveVerificationStep: verificationFlowHelpers.resolveVerificationStep,
   reuseOrCreateTab,
   sendToContentScript,
@@ -14861,6 +14885,8 @@ const step8Executor = self.MultiPageBackgroundStep8?.createStep8Executor({
   isTabAlive,
   isVerificationMailPollingError,
   LUCKMAIL_PROVIDER,
+  CUSTOM_ICLOUD_MAIL_PROVIDER,
+  resolveCustomIcloudVerificationStep: verificationFlowHelpers.resolveCustomIcloudVerificationStep,
   resolveVerificationStep: verificationFlowHelpers.resolveVerificationStep,
   resolveSignupEmailForFlow,
   persistRegistrationEmailState,
@@ -15426,6 +15452,9 @@ function getMailConfig(state) {
   const provider = state.mailProvider || 'qq';
   if (provider === 'custom') {
     return { provider: 'custom', label: '自定义邮箱' };
+  }
+  if (provider === CUSTOM_ICLOUD_MAIL_PROVIDER) {
+    return { provider: CUSTOM_ICLOUD_MAIL_PROVIDER, label: '自定义邮箱（icloud）', apiCode: true };
   }
   if (provider === HOTMAIL_PROVIDER) {
     return { provider: HOTMAIL_PROVIDER, label: 'Hotmail（API对接/本地助手）' };

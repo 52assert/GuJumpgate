@@ -28,6 +28,8 @@
 	      case 'custom':
 	      case 'manual':
 	        return 'custom';
+	      case 'custom-icloud':
+	        return 'custom-icloud';
 	      case HOTMAIL_PROVIDER:
 	      case '163':
 	      case '163-vip':
@@ -78,6 +80,9 @@
 
 	    if (provider === 'custom') {
 	      return { provider: 'custom', label: '自定义邮箱（手动验证码）', manual: true };
+	    }
+	    if (provider === 'custom-icloud') {
+	      return { provider: 'custom-icloud', label: '自定义邮箱（icloud）', apiCode: true };
 	    }
 	    if (provider === HOTMAIL_PROVIDER) {
 	      return { provider: HOTMAIL_PROVIDER, label: 'Hotmail（微软 Graph）' };

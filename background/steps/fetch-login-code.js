@@ -23,6 +23,8 @@
       isTabAlive,
       isVerificationMailPollingError,
       LUCKMAIL_PROVIDER,
+      CUSTOM_ICLOUD_MAIL_PROVIDER = 'custom-icloud',
+      resolveCustomIcloudVerificationStep,
       resolveSignupEmailForFlow,
       resolveVerificationStep,
       rerunStep7ForStep8Recovery,
@@ -588,6 +590,15 @@
       await addLog(`步骤 ${visibleStep}：邮箱验证码页面已就绪，开始获取验证码。`, 'info');
       if (shouldCompareVerificationEmail && displayedVerificationEmail) {
         await addLog(`步骤 ${visibleStep}：已固定当前验证码页显示邮箱 ${displayedVerificationEmail} 作为后续匹配目标。`, 'info');
+      }
+
+      if (mail.apiCode && typeof resolveCustomIcloudVerificationStep === 'function') {
+        await resolveCustomIcloudVerificationStep(8, {
+          completionStep: visibleStep,
+          promptStep: visibleStep,
+          getRemainingTimeMs: getStep8RemainingTimeResolver(preparedState?.oauthUrl || '', visibleStep),
+        });
+        return { lastResendAt: latestResendAt };
       }
 
       if (shouldUseCustomRegistrationEmail(preparedState)) {
